@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>風と波 日本近海</title>
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.css">
+<script src="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.js"></script>
+<style>
+  :root{
+    --bg:#060d17; --panel:rgba(8,18,31,.86); --line:rgba(150,190,230,.22);
+    --ink:#e8f0f8; --sub:#93a9c0; --wind:#f5a524; --swell:#4fa7f5;
+  }
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);
+    font-family:"Hiragino Sans","Hiragino Kaku Gothic ProN","Noto Sans JP",system-ui,sans-serif}
+  #map{position:absolute;inset:0}
+  .card{position:absolute;z-index:2;background:var(--panel);border:1px solid var(--line);
+    border-radius:10px;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+  #head{top:16px;left:16px;width:340px;padding:16px 18px 14px}
+  #head h1{margin:0;font-size:26px;letter-spacing:.04em;font-weight:700}
+  #head h1 .date{display:block;font-size:15px;font-weight:500;color:var(--sub);letter-spacing:.02em;margin-top:4px}
+  .tag{margin:8px 0 0;font-size:13px;color:#cfe3f7;font-family:ui-monospace,Menlo,monospace}
+  .lead{margin:10px 0 0;font-size:13px;line-height:1.6;color:var(--sub)}
+  .lead b.w{color:var(--wind)} .lead b.s{color:var(--swell)}
+  .stats{display:flex;gap:14px;margin-top:10px;font-size:12px;color:var(--sub)}
+  .stats strong{display:block;font-size:20px;color:var(--ink);font-variant-numeric:tabular-nums}
+  .stats .w strong{color:var(--wind)} .stats .s strong{color:var(--swell)}
+  .ctrl{display:flex;flex-wrap:wrap;gap:6px;margin-top:12px}
+  .ctrl button{font:inherit;font-size:12px;color:var(--ink);background:rgba(255,255,255,.06);
+    border:1px solid var(--line);border-radius:999px;padding:5px 11px;cursor:pointer}
+  .ctrl button[aria-pressed="true"]{background:#e8f0f8;color:#08121f;border-color:#e8f0f8}
+  #legend{left:16px;bottom:16px;width:340px;padding:12px 18px 12px;font-size:12px;color:var(--sub)}
+  #legend h2{margin:0 0 6px;font-size:12px;font-weight:600;color:var(--ink)}
+  .ramp{display:grid;grid-template-columns:72px 1fr;align-items:center;gap:6px;margin:4px 0}
+  .ramp .bar{height:10px;border-radius:3px}
+  .ticks{display:flex;justify-content:space-between;margin-left:78px;font-variant-numeric:tabular-nums}
+  .rule{margin:8px 0 0;line-height:1.5}
+  .arrows{display:flex;align-items:flex-end;gap:14px;margin-top:8px}
+  .arrows span{display:flex;align-items:center;gap:4px}
+  .credit{margin:10px 0 0;font-size:11px;line-height:1.5;border-top:1px solid var(--line);padding-top:8px}
+  .credit a{color:#cfe3f7}
+  .hidden{display:none!important}
+  .maplibregl-popup-content{background:#0b1726;color:var(--ink);border:1px solid var(--line);
+    border-radius:8px;padding:10px 12px;font-size:12px;line-height:1.55;box-shadow:0 6px 24px rgba(0,0,0,.5)}
+  .maplibregl-popup-tip{border-top-color:#0b1726!important;border-bottom-color:#0b1726!important}
+  .maplibregl-popup-close-button{color:var(--sub);font-size:16px}
+  .pp h3{margin:0 0 4px;font-size:13px}
+  .pp table{border-collapse:collapse;font-variant-numeric:tabular-nums}
+  .pp td{padding:1px 8px 1px 0;white-space:nowrap} .pp td:first-child{color:var(--sub)}
+  .pp .badge{display:inline-block;padding:1px 7px;border-radius:999px;font-size:11px;font-weight:600;color:#08121f}
+  .maplibregl-ctrl-attrib{background:rgba(8,18,31,.75)!important;color:var(--sub)}
+  .maplibregl-ctrl-attrib a{color:#cfe3f7!important}
+  /* 投稿用の静止画（?shot=1）では操作 UI を出さない */
+  body.shot .ctrl, body.shot .maplibregl-ctrl-top-right{display:none}
+  body.shot #head{width:380px;top:28px;left:28px} body.shot #legend{width:380px;left:28px;bottom:28px}
+  body.shot #head h1{font-size:30px}
+  @media (max-width:600px){
+    #head{top:8px;left:8px;right:8px;width:auto;padding:10px 12px}
+    #head h1{font-size:20px} #head h1 .date{font-size:13px;display:inline;margin-left:6px}
+    .lead{display:none} .maplibregl-ctrl-top-right{display:none} .stats{margin-top:6px} .stats strong{font-size:16px}
+    #legend{left:8px;right:8px;bottom:8px;width:auto;padding:8px 12px}
+    #legend.collapsed .more{display:none}
+    .ramp{grid-template-columns:64px 1fr}.ticks{margin-left:70px}
+  }
+</style>
+</head>
+<body>
+<div id="map" role="region" aria-label="日本近海の風と波の地図"></div>
+
+<section id="head" class="card">
+  <h1>風と波<span class="date" id="date">— 日本近海</span></h1>
+  <p class="tag">#30DayMapChallenge Day 13: Interactions</p>
+  <p class="lead">その場の風が起こす<b class="w">風浪</b>と、遠くから届く<b class="s">うねり</b>。各点でどちらが高いかを色で分け、明るさで有義波高を示す。矢印は風の吹いていく向き。</p>
+  <div class="stats">
+    <div class="w"><strong id="nWind">–</strong>風浪優勢</div>
+    <div class="s"><strong id="nSwell">–</strong>うねり優勢</div>
+    <div><strong id="maxH">–</strong>最大波高</div>
+  </div>
+  <div class="ctrl" role="group" aria-label="表示の切り替え">
+    <button id="bBiv" aria-pressed="true">優勢×波高</button>
+    <button id="bH" aria-pressed="false">波高のみ</button>
+    <button id="bSwell" aria-pressed="false">うねりの向き</button>
+    <button id="bWind" aria-pressed="true">風の矢印</button>
+  </div>
+</section>
+
+<section id="legend" class="card">
+  <h2>有義波高（m）</h2>
+  <div id="lgBiv">
+    <div class="ramp"><span style="color:var(--wind)">風浪優勢</span><div class="bar" id="rampW"></div></div>
+    <div class="ramp"><span style="color:var(--swell)">うねり優勢</span><div class="bar" id="rampS"></div></div>
+  </div>
+  <div id="lgH" class="hidden">
+    <div class="ramp"><span>波高</span><div class="bar" id="rampH"></div></div>
+  </div>
+  <div class="ticks"><span>0</span><span>1</span><span>2</span><span>3</span><span>4</span></div>
+  <div class="more">
+    <p class="rule">判定：風浪の高さ ＞ うねりの高さ なら<b style="color:var(--wind)">風浪優勢</b>、それ以外は<b style="color:var(--swell)">うねり優勢</b>。点は 1° 格子の値。</p>
+    <div class="arrows" aria-label="風速の凡例">
+      <span><canvas width="14" height="34" data-kn="5"></canvas>5 kn</span>
+      <span><canvas width="14" height="34" data-kn="15"></canvas>15 kn</span>
+      <span><canvas width="14" height="34" data-kn="25"></canvas>25 kn</span>
+      <span id="lgSwellArrow" class="hidden"><canvas width="14" height="34" data-swell="1"></canvas>うねりの進む向き</span>
+    </div>
+    <p class="credit" id="credit">Weather data by <a href="https://open-meteo.com/">Open-Meteo.com</a>（CC BY 4.0）<br>
+      背景地図 © <a href="https://openfreemap.org/">OpenFreeMap</a> © <a href="https://www.openmaptiles.org/">OpenMapTiles</a> © <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a><br>
+      <span id="dtime">データ時刻：–</span></p>
+  </div>
+</section>
+
+<script>
+const SHOT = new URLSearchParams(location.search).has('shot');
+if (SHOT) document.body.classList.add('shot');
+
+// 有義波高の配色。風浪＝琥珀、うねり＝青、波高のみ＝青緑→白
+const STOPS = [0, 0.5, 1, 2, 3, 4];
+const RAMP_W = ['#3a2812', '#74481a', '#b8711f', '#f0a12a', '#ffd27a', '#fff4dc'];
+const RAMP_S = ['#12243a', '#1b4472', '#2a70b8', '#4ea4f2', '#9fd0ff', '#eaf5ff'];
+const RAMP_H = ['#0f2b3a', '#155a6b', '#1f8a8f', '#5cbf9c', '#c4e6a0', '#fffbe0'];
+const ramp = cols => ['interpolate', ['linear'], ['get', 'h'], ...STOPS.flatMap((s, i) => [s, cols[i]])];
+const css = cols => `linear-gradient(90deg,${STOPS.map((s, i) => `${cols[i]} ${s / 4 * 100}%`).join(',')})`;
+document.getElementById('rampW').style.background = css(RAMP_W);
+document.getElementById('rampS').style.background = css(RAMP_S);
+document.getElementById('rampH').style.background = css(RAMP_H);
+
+const KN_MAX = 30;
+// 矢印アイコン（上＝北向き、長さ 64px）。icon-size で風速に比例させる
+function drawArrow(ctx, w, h, color, thin) {
+  ctx.clearRect(0, 0, w, h);
+  ctx.strokeStyle = ctx.fillStyle = color; ctx.lineCap = 'round';
+  ctx.lineWidth = thin ? w * 0.12 : w * 0.2;
+  const head = Math.min(h * 0.35, w * 1.1);
+  ctx.beginPath(); ctx.moveTo(w / 2, h - 2); ctx.lineTo(w / 2, head * 0.8); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(w / 2, 1); ctx.lineTo(w * 0.92, head); ctx.lineTo(w * 0.08, head); ctx.closePath(); ctx.fill();
+}
+function arrowImage(color, thin) {
+  const c = document.createElement('canvas'); c.width = 20; c.height = 64;
+  const ctx = c.getContext('2d');
+  if (!thin) { ctx.shadowColor = 'rgba(0,0,0,.7)'; ctx.shadowBlur = 3; }
+  drawArrow(ctx, 20, 64, color, thin);
+  return ctx.getImageData(0, 0, 20, 64);
+}
+const windSize = kn => 0.18 + 0.82 * Math.min(kn, KN_MAX) / KN_MAX;  // 0 kn→0.18、30 kn 以上→1.0
+document.querySelectorAll('.arrows canvas').forEach(c => {
+  const ctx = c.getContext('2d');
+  if (c.dataset.swell) { drawArrow(ctx, 14, 34, '#9fd0ff', true); return; }
+  const h = 34 * windSize(+c.dataset.kn) / windSize(25);
+  ctx.translate(0, 34 - h); drawArrow(ctx, 14, h, '#ffffff', false);
+});
+
+const DIR16 = ['北', '北北東', '北東', '東北東', '東', '東南東', '南東', '南南東', '南', '南南西', '南西', '西南西', '西', '西北西', '北西', '北北西'];
+const dir16 = d => DIR16[Math.round(((d % 360) + 360) % 360 / 22.5) % 16];
+// API の向きは「来る方角」。地図の矢印は「進む方角」に直す
+const toward = from => (from + 180) % 360;
+const fmt = (v, nd = 2) => v == null ? '不明' : (+v).toFixed(nd);
+const classify = p => (p.wind_wave_height == null || p.swell_wave_height == null) ? null
+  : (p.wind_wave_height > p.swell_wave_height ? 'wind' : 'swell');
+
+let DATA;
+const map = new maplibregl.Map({
+  container: 'map',
+  style: 'https://tiles.openfreemap.org/styles/dark',
+  bounds: [[121.5, 23.5], [150.5, 46.5]],
+  fitBoundsOptions: { padding: 20 },
+  attributionControl: { compact: false, customAttribution: 'Weather data by <a href="https://open-meteo.com/">Open-Meteo.com</a>' },
+  canvasContextAttributes: { preserveDrawingBuffer: true },
+  dragRotate: false, pitchWithRotate: false,
+});
+map.touchZoomRotate.disableRotation();
+// 背景スタイルが参照する POI アイコン（circle-11 など）はスプライトに無い。POI は隠すので空画像で埋めて警告を止める
+map.on('styleimagemissing', e => { if (!map.hasImage(e.id)) map.addImage(e.id, { width: 1, height: 1, data: new Uint8Array(4) }); });
+map.addControl(new maplibregl.NavigationControl({ showCompass: false }), 'top-right');
+
+function fitView() {
+  const wide = innerWidth > 900;
+  const pad = SHOT ? { top: 30, bottom: 30, left: 440, right: 30 }
+    : wide ? { top: 30, bottom: 30, left: 380, right: 60 } : { top: 140, bottom: 150, left: 10, right: 10 };
+  try { map.fitBounds([[121.5, 23.5], [150.5, 46.5]], { padding: pad, duration: 0 }); } catch (e) { /* 大きさ 0 のとき */ }
+}
+
+function toGeoJSON(d) {
+  return {
+    type: 'FeatureCollection',
+    features: d.points.map((p, i) => ({ p, i })).filter(({ p }) => p.wave_height != null).map(({ p, i }) => ({
+      type: 'Feature', id: i,
+      // 位置は要求した 1° 格子。値は API が返した最寄りの格子点（wave_at / wind_at）のもの
+      geometry: { type: 'Point', coordinates: [p.grid[1], p.grid[0]] },
+      properties: {
+        i, h: p.wave_height, cls: classify(p),
+        kn: p.wind_speed_kn ?? 0, wind_to: p.wind_from_deg == null ? 0 : toward(p.wind_from_deg),
+        has_wind: p.wind_from_deg != null,
+        sh: p.swell_wave_height ?? 0, swell_to: p.swell_wave_direction == null ? 0 : toward(p.swell_wave_direction),
+      },
+    })),
+  };
+}
+
+function popupHTML(p) {
+  const c = classify(p);
+  const badge = c == null ? '<span class="badge" style="background:#93a9c0">判定なし</span>'
+    : `<span class="badge" style="background:${c === 'wind' ? 'var(--wind)' : 'var(--swell)'}">${c === 'wind' ? '風浪優勢' : 'うねり優勢'}</span>`;
+  const wto = p.wind_from_deg == null ? null : toward(p.wind_from_deg);
+  return `<div class="pp"><h3>北緯 ${p.grid[0]}° 東経 ${p.grid[1]}° ${badge}</h3><table>
+    <tr><td>風</td><td>${fmt(p.wind_speed_kn, 1)} kn・${p.wind_from_deg ?? '不明'}°（${p.wind_from_deg == null ? '' : dir16(p.wind_from_deg) + 'の風'}）→ ${wto == null ? '' : dir16(wto) + 'へ'}</td></tr>
+    <tr><td>有義波高</td><td>${fmt(p.wave_height)} m・周期 ${fmt(p.wave_period)} s・${p.wave_direction ?? '不明'}°から</td></tr>
+    <tr><td>風浪</td><td>${fmt(p.wind_wave_height)} m・周期 ${fmt(p.wind_wave_period)} s・${p.wind_wave_direction ?? '不明'}°から</td></tr>
+    <tr><td>うねり</td><td>${fmt(p.swell_wave_height)} m・周期 ${fmt(p.swell_wave_period)} s・${p.swell_wave_direction ?? '不明'}°（${p.swell_wave_direction == null ? '' : dir16(p.swell_wave_direction)}）から</td></tr>
+  </table></div>`;
+}
+
+function restyleBase() {
+  // 背景は暗い海図調に寄せる。自前の点が主役なので地物は控えめに
+  const set = (id, prop, v) => { if (map.getLayer(id)) map.setPaintProperty(id, prop, v); };
+  set('background', 'background-color', '#141a22');
+  set('water', 'fill-color', '#07101c');
+  for (const l of map.getStyle().layers) {
+    if (l.type === 'symbol' && l['source-layer'] !== 'place') map.setLayoutProperty(l.id, 'visibility', 'none');
+    if (l.type === 'symbol' && l['source-layer'] === 'place') {
+      map.setLayoutProperty(l.id, 'text-field', ['coalesce', ['get', 'name:ja'], ['get', 'name']]);
+      if (!/^place_(city_large|country)/.test(l.id)) map.setLayoutProperty(l.id, 'visibility', 'none');
+      else map.setPaintProperty(l.id, 'text-opacity', 0.75);
+    }
+    if (/^(highway|railway|road|aeroway|building)/.test(l.id)) map.setLayoutProperty(l.id, 'visibility', 'none');
+  }
+}
+
+map.on('load', async () => {
+  restyleBase();
+  const res = await fetch('data.json', { cache: 'no-cache' });
+  DATA = await res.json();
+  window.DATA = DATA;
+  const day = (DATA.model_time_jst.wave[0] || '').slice(0, 10);
+  document.getElementById('date').textContent = `— ${day} 日本近海`;
+  document.title = `風と波 ${day} 日本近海`;
+  document.getElementById('dtime').textContent =
+    `データ時刻：波 ${DATA.model_time_jst.wave.join('／').replace(/T/g, ' ')}・風 ${DATA.model_time_jst.wind.join('／').replace(/T/g, ' ')}（JST、モデル値）／取得 ${DATA.fetched_at_jst.replace('T', ' ').slice(0, 16)}`;
+
+  const gj = toGeoJSON(DATA);
+  const sea = DATA.points.filter(p => p.wave_height != null);
+  const nW = sea.filter(p => classify(p) === 'wind').length, nS = sea.filter(p => classify(p) === 'swell').length;
+  const top = sea.reduce((a, b) => b.wave_height > a.wave_height ? b : a);
+  document.getElementById('nWind').textContent = nW;
+  document.getElementById('nSwell').textContent = nS;
+  document.getElementById('maxH').textContent = `${top.wave_height.toFixed(1)} m`;
+
+  map.addImage('arrow-wind', arrowImage('#ffffff', false));
+  map.addImage('arrow-swell', arrowImage('#9fd0ff', true));
+  map.addSource('pts', { type: 'geojson', data: gj });
+  const before = map.getLayer('boundary_state') ? 'boundary_state' : undefined;
+  // 点の半径は格子間隔（1°）の約 35%。海岸線が隙間から見えるように詰めすぎない。ズームで 2 倍ずつ
+  const radius = ['interpolate', ['exponential', 2], ['zoom'], 2, 2, 4, 8, 8, 128];
+  map.addLayer({ id: 'cells', type: 'circle', source: 'pts', paint: {
+    'circle-radius': radius,
+    'circle-color': ['case', ['==', ['get', 'cls'], 'wind'], ramp(RAMP_W), ramp(RAMP_S)],
+    'circle-blur': 0.15, 'circle-opacity': 0.95,
+    'circle-stroke-width': ['case', ['boolean', ['feature-state', 'hover'], false], 2, 0],
+    'circle-stroke-color': '#ffffff',
+  } }, before);
+  // 陸の面は背景色なので点の上に塗り直せない。代わりに水域ポリゴンの縁を海岸線として点の上に引く
+  map.addLayer({ id: 'coast', type: 'line', source: 'openmaptiles', 'source-layer': 'water',
+    paint: { 'line-color': '#b9d3ec', 'line-opacity': 0.6, 'line-width': ['interpolate', ['linear'], ['zoom'], 3, 0.5, 8, 1.2] } }, before);
+  map.addLayer({ id: 'swell', type: 'symbol', source: 'pts', layout: {
+    visibility: 'none', 'icon-image': 'arrow-swell', 'icon-rotate': ['get', 'swell_to'],
+    'icon-rotation-alignment': 'map', 'icon-allow-overlap': true, 'icon-ignore-placement': true,
+    'icon-size': ['interpolate', ['linear'], ['get', 'sh'], 0, 0.15, 3, 0.75],
+  } });
+  map.addLayer({ id: 'wind', type: 'symbol', source: 'pts', filter: ['get', 'has_wind'], layout: {
+    'icon-image': 'arrow-wind', 'icon-rotate': ['get', 'wind_to'],
+    'icon-rotation-alignment': 'map', 'icon-allow-overlap': true, 'icon-ignore-placement': true,
+    // zoom は最上位の interpolate にしか置けない。各段で風速の倍率を掛ける
+    'icon-size': ['interpolate', ['linear'], ['zoom'], ...[[3, 0.42], [5, 0.62], [8, 1.2]].flatMap(([z, k]) =>
+      [z, ['*', k, ['interpolate', ['linear'], ['min', ['get', 'kn'], KN_MAX], 0, windSize(0), KN_MAX, windSize(KN_MAX)]]])],
+  }, paint: { 'icon-opacity': 0.92 } });
+  fitView();
+
+  // なぞる／タップで値を出す。値は data.json の元の行から読む（GeoJSON 側の丸めを通さない）
+  const popup = new maplibregl.Popup({ closeButton: false, closeOnClick: false, maxWidth: '340px', offset: 12 });
+  let hovered = null;
+  const show = e => {
+    const f = e.features && e.features[0]; if (!f) return;
+    if (hovered !== null) map.setFeatureState({ source: 'pts', id: hovered }, { hover: false });
+    hovered = f.id; map.setFeatureState({ source: 'pts', id: hovered }, { hover: true });
+    map.getCanvas().style.cursor = 'pointer';
+    popup.setLngLat(f.geometry.coordinates).setHTML(popupHTML(DATA.points[f.properties.i])).addTo(map);
+  };
+  map.on('mousemove', 'cells', show);
+  map.on('click', 'cells', show);
+  map.on('mouseleave', 'cells', () => {
+    if (hovered !== null) map.setFeatureState({ source: 'pts', id: hovered }, { hover: false });
+    hovered = null; map.getCanvas().style.cursor = ''; popup.remove();
+  });
+  map.on('click', e => { if (!map.queryRenderedFeatures(e.point, { layers: ['cells'] }).length) popup.remove(); });
+  window.__ready = true;
+});
+
+function press(btn, on) { btn.setAttribute('aria-pressed', on); }
+const bBiv = document.getElementById('bBiv'), bH = document.getElementById('bH');
+function setMode(biv) {
+  press(bBiv, biv); press(bH, !biv);
+  map.setPaintProperty('cells', 'circle-color', biv ? ['case', ['==', ['get', 'cls'], 'wind'], ramp(RAMP_W), ramp(RAMP_S)] : ramp(RAMP_H));
+  document.getElementById('lgBiv').classList.toggle('hidden', !biv);
+  document.getElementById('lgH').classList.toggle('hidden', biv);
+}
+bBiv.onclick = () => setMode(true);
+bH.onclick = () => setMode(false);
+document.getElementById('bSwell').onclick = e => {
+  const on = e.currentTarget.getAttribute('aria-pressed') !== 'true'; press(e.currentTarget, on);
+  map.setLayoutProperty('swell', 'visibility', on ? 'visible' : 'none');
+  document.getElementById('lgSwellArrow').classList.toggle('hidden', !on);
+};
+document.getElementById('bWind').onclick = e => {
+  const on = e.currentTarget.getAttribute('aria-pressed') !== 'true'; press(e.currentTarget, on);
+  map.setLayoutProperty('wind', 'visibility', on ? 'visible' : 'none');
+};
+window.addEventListener('resize', () => { if (window.__ready && SHOT) fitView(); });
+</script>
+</body>
+</html>
