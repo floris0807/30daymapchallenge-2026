@@ -40,6 +40,9 @@
   .credit{margin:10px 0 0;font-size:11px;line-height:1.5;border-top:1px solid var(--line);padding-top:8px}
   .credit a{color:#cfe3f7}
   .hidden{display:none!important}
+  #particles{position:absolute;top:0;left:0;pointer-events:none}
+  .motion{margin:8px 0 0;line-height:1.5}
+  .motion i{display:inline-block;width:14px;height:2px;background:#fff;vertical-align:middle;margin-right:4px;border-radius:1px}
   .maplibregl-popup-content{background:#0b1726;color:var(--ink);border:1px solid var(--line);
     border-radius:8px;padding:10px 12px;font-size:12px;line-height:1.55;box-shadow:0 6px 24px rgba(0,0,0,.5)}
   .maplibregl-popup-tip{border-top-color:#0b1726!important;border-bottom-color:#0b1726!important}
@@ -58,7 +61,7 @@
     #head{top:8px;left:8px;right:8px;width:auto;padding:10px 12px}
     #head h1{font-size:20px} #head h1 .date{font-size:13px;display:inline;margin-left:6px}
     .lead{display:none} .maplibregl-ctrl-top-right{display:none} .stats{margin-top:6px} .stats strong{font-size:16px}
-    #legend{left:8px;right:8px;bottom:8px;width:auto;padding:8px 12px}
+    #legend{left:8px;right:8px;bottom:8px;width:auto;padding:8px 12px;max-height:38vh;overflow:auto}
     #legend.collapsed .more{display:none}
     .ramp{grid-template-columns:64px 1fr}.ticks{margin-left:70px}
   }
@@ -70,7 +73,7 @@
 <section id="head" class="card">
   <h1>風と波<span class="date" id="date">— 日本近海</span></h1>
   <p class="tag">#30DayMapChallenge Day 13: Interactions</p>
-  <p class="lead">その場の風が起こす<b class="w">風浪</b>と、遠くから届く<b class="s">うねり</b>。各点でどちらが高いかを色で分け、明るさで有義波高を示す。矢印は風の吹いていく向き。</p>
+  <p class="lead">その場の風が起こす<b class="w">風浪</b>と、遠くから届く<b class="s">うねり</b>。各点でどちらが高いかを色で分け、明るさで有義波高を示す。白い粒は風に乗って流れ、点は波の周期で脈打つ。</p>
   <div class="stats">
     <div class="w"><strong id="nWind">–</strong>風浪優勢</div>
     <div class="s"><strong id="nSwell">–</strong>うねり優勢</div>
@@ -80,7 +83,8 @@
     <button id="bBiv" aria-pressed="true">優勢×波高</button>
     <button id="bH" aria-pressed="false">波高のみ</button>
     <button id="bSwell" aria-pressed="false">うねりの向き</button>
-    <button id="bWind" aria-pressed="true">風の矢印</button>
+    <button id="bWind" aria-pressed="false">風の矢印</button>
+    <button id="bAnim" aria-pressed="false">動きを止める</button>
   </div>
 </section>
 
@@ -96,7 +100,8 @@
   <div class="ticks"><span>0</span><span>1</span><span>2</span><span>3</span><span>4</span></div>
   <div class="more">
     <p class="rule">判定：風浪の高さ ＞ うねりの高さ なら<b style="color:var(--wind)">風浪優勢</b>、それ以外は<b style="color:var(--swell)">うねり優勢</b>。点は 1° 格子の値。</p>
-    <div class="arrows" aria-label="風速の凡例">
+    <p class="motion"><i></i>白い粒：風の吹いていく向きへ流れる。速さは風速に比例（見やすく誇張）。<br>点の脈動：波の周期（wave_period）。6 秒のループ＝海の 24 秒（4 倍速）で、24 秒に収まる回数だけ脈打つ。</p>
+    <div class="arrows hidden" id="lgArrows" aria-label="風速の凡例">
       <span><canvas width="14" height="34" data-kn="5"></canvas>5 kn</span>
       <span><canvas width="14" height="34" data-kn="15"></canvas>15 kn</span>
       <span><canvas width="14" height="34" data-kn="25"></canvas>25 kn</span>
@@ -187,6 +192,8 @@ function toGeoJSON(d) {
       geometry: { type: 'Point', coordinates: [p.grid[1], p.grid[0]] },
       properties: {
         i, h: p.wave_height, cls: classify(p),
+        // ループ内の脈動回数と位相。回数は海の 24 秒に周期が何回入るか（整数でないとループがつながらない）
+        n: pulseCount(p.wave_period), ph: phaseOf(i),
         kn: p.wind_speed_kn ?? 0, wind_to: p.wind_from_deg == null ? 0 : toward(p.wind_from_deg),
         has_wind: p.wind_from_deg != null,
         sh: p.swell_wave_height ?? 0, swell_to: p.swell_wave_direction == null ? 0 : toward(p.swell_wave_direction),
@@ -248,9 +255,8 @@ map.on('load', async () => {
   map.addSource('pts', { type: 'geojson', data: gj });
   const before = map.getLayer('boundary_state') ? 'boundary_state' : undefined;
   // 点の半径は格子間隔（1°）の約 35%。海岸線が隙間から見えるように詰めすぎない。ズームで 2 倍ずつ
-  const radius = ['interpolate', ['exponential', 2], ['zoom'], 2, 2, 4, 8, 8, 128];
   map.addLayer({ id: 'cells', type: 'circle', source: 'pts', paint: {
-    'circle-radius': radius,
+    'circle-radius': radiusAt(0),
     'circle-color': ['case', ['==', ['get', 'cls'], 'wind'], ramp(RAMP_W), ramp(RAMP_S)],
     'circle-blur': 0.15, 'circle-opacity': 0.95,
     'circle-stroke-width': ['case', ['boolean', ['feature-state', 'hover'], false], 2, 0],
@@ -265,6 +271,7 @@ map.on('load', async () => {
     'icon-size': ['interpolate', ['linear'], ['get', 'sh'], 0, 0.15, 3, 0.75],
   } });
   map.addLayer({ id: 'wind', type: 'symbol', source: 'pts', filter: ['get', 'has_wind'], layout: {
+    visibility: 'none',
     'icon-image': 'arrow-wind', 'icon-rotate': ['get', 'wind_to'],
     'icon-rotation-alignment': 'map', 'icon-allow-overlap': true, 'icon-ignore-placement': true,
     // zoom は最上位の interpolate にしか置けない。各段で風速の倍率を掛ける
@@ -290,6 +297,8 @@ map.on('load', async () => {
     hovered = null; map.getCanvas().style.cursor = ''; popup.remove();
   });
   map.on('click', e => { if (!map.queryRenderedFeatures(e.point, { layers: ['cells'] }).length) popup.remove(); });
+  initParticles(DATA);
+  render(0);
   window.__ready = true;
 });
 
@@ -311,8 +320,140 @@ document.getElementById('bSwell').onclick = e => {
 document.getElementById('bWind').onclick = e => {
   const on = e.currentTarget.getAttribute('aria-pressed') !== 'true'; press(e.currentTarget, on);
   map.setLayoutProperty('wind', 'visibility', on ? 'visible' : 'none');
+  document.getElementById('lgArrows').classList.toggle('hidden', !on);
 };
 window.addEventListener('resize', () => { if (window.__ready && SHOT) fitView(); });
+
+// ===== 動き：風の粒と波の脈動 =====
+// 絵は時刻 t（0〜LOOP 秒）だけで決まる。粒の状態を前のコマから持ち越さないので、コマ送りでも実時間でも同じ絵になる
+const LOOP = 6, SEA_SECONDS = 24;          // 6 秒のループで海の 24 秒を見せる
+const SPEED = 0.05;                        // 粒の速さ［度/(kn・秒)］。見やすさのための誇張
+const N_PARTICLES = 1800, STEP = 1 / 20, TRAIL = 0.4;
+const LIVES = [1.5, 2, 3];                 // どれも LOOP を割り切る。寿命がループでちょうど一巡する
+function pulseCount(T) { return T == null ? 0 : Math.max(1, Math.round(SEA_SECONDS / T)); }
+function phaseOf(i) { return mulberry32(1000 + i)() * Math.PI * 2; }
+function mulberry32(a) { return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+// 半径は格子間隔（1°）の約 35% を上限に、82〜100% の間で脈打つ。色（＝判定と波高）は変えない
+function radiusAt(t) {
+  const k = ['+', 0.82, ['*', 0.09, ['+', 1, ['cos', ['+', ['get', 'ph'], ['*', ['get', 'n'], 2 * Math.PI * t / LOOP]]]]]];
+  return ['interpolate', ['exponential', 2], ['zoom'], 2, ['*', 2, k], 4, ['*', 8, k], 8, ['*', 128, k]];
+}
+
+let FIELD, PARTS, pctx, pcanvas, curT = 0;
+let playing = !SHOT && !matchMedia('(prefers-reduced-motion: reduce)').matches;
+function initParticles(d) {
+  const [la0, la1] = d.grid.lat, [lo0, lo1] = d.grid.lon, nx = lo1 - lo0 + 1, ny = la1 - la0 + 1;
+  const U = new Float32Array(nx * ny), V = new Float32Array(nx * ny), SEA = new Float32Array(nx * ny);
+  for (const p of d.points) {
+    const k = (p.grid[0] - la0) * nx + (p.grid[1] - lo0);
+    const to = toward(p.wind_from_deg ?? 0) * Math.PI / 180, kn = p.wind_speed_kn ?? 0;
+    U[k] = kn * Math.sin(to); V[k] = kn * Math.cos(to); SEA[k] = p.wave_height == null ? 0 : 1;
+  }
+  FIELD = { la0, lo0, nx, ny, U, V, SEA };
+  const rnd = mulberry32(13);
+  PARTS = [];
+  for (let i = 0; i < N_PARTICLES; i++) {
+    const life = LIVES[Math.floor(rnd() * LIVES.length)], cycles = Math.round(LOOP / life);
+    const spawns = [];
+    for (let j = 0; j < cycles; j++) {
+      let lon, lat;
+      for (let tries = 0; tries < 30; tries++) {   // 海の上に生まれるまで引き直す
+        lon = lo0 + rnd() * (nx - 1); lat = la0 + rnd() * (ny - 1);
+        if (sample(lon, lat)[2] > 0.7) break;
+      }
+      spawns.push([lon, lat]);
+    }
+    PARTS.push({ life, cycles, offset: rnd() * life, spawns });
+  }
+  pcanvas = document.createElement('canvas'); pcanvas.id = 'particles';
+  map.getCanvasContainer().appendChild(pcanvas);
+  pctx = pcanvas.getContext('2d');
+  map.on('resize', () => drawParticles(curT));
+  map.on('move', () => drawParticles(curT));
+}
+// 双線形補間で [u, v, 海らしさ0〜1]。格子の外は海でない扱い
+function sample(lon, lat) {
+  const { la0, lo0, nx, ny, U, V, SEA } = FIELD;
+  const x = lon - lo0, y = lat - la0;
+  if (x < 0 || y < 0 || x > nx - 1 || y > ny - 1) return [0, 0, 0];
+  const i = Math.min(Math.floor(x), nx - 2), j = Math.min(Math.floor(y), ny - 2), fx = x - i, fy = y - j;
+  const k = j * nx + i, w00 = (1 - fx) * (1 - fy), w10 = fx * (1 - fy), w01 = (1 - fx) * fy, w11 = fx * fy;
+  const f = A => A[k] * w00 + A[k + 1] * w10 + A[k + nx] * w01 + A[k + nx + 1] * w11;
+  return [f(U), f(V), f(SEA)];
+}
+// 1 秒ぶん進める量（度）。経度は cos(緯度) で割り、メルカトルの画面上で風向どおりに進ませる
+function velocity(lon, lat) {
+  const [u, v, sea] = sample(lon, lat);
+  return [u * SPEED / Math.cos(lat * Math.PI / 180), v * SPEED, sea];
+}
+function particleAt(P, t) {
+  const tt = t + P.offset, age = tt % P.life, j = Math.floor(tt / P.life) % P.cycles;
+  let [lon, lat] = P.spawns[j], tail = [lon, lat], sea = 1;
+  const steps = Math.floor(age / STEP), rest = age - steps * STEP, tailStep = Math.floor((age - TRAIL) / STEP);
+  for (let s = 0; s <= steps; s++) {
+    if (s === tailStep) tail = [lon, lat];
+    const dt = s === steps ? rest : STEP;
+    const [dx, dy, se] = velocity(lon, lat); sea = se;
+    lon += dx * dt; lat += dy * dt;
+  }
+  const fade = Math.sin(Math.PI * age / P.life);              // 生まれと消えは透明。寿命の切れ目で飛ばない
+  const land = Math.min(1, Math.max(0, (sample(lon, lat)[2] - 0.35) / 0.4)); // 陸に近づくほど薄く
+  return { head: [lon, lat], tail, alpha: fade * land };
+}
+function drawParticles(t) {
+  if (!pctx) return;
+  const c = map.getCanvas(), dpr = devicePixelRatio || 1, w = c.clientWidth, h = c.clientHeight;
+  if (pcanvas.width !== Math.round(w * dpr)) { pcanvas.width = Math.round(w * dpr); pcanvas.height = Math.round(h * dpr);
+    pcanvas.style.width = w + 'px'; pcanvas.style.height = h + 'px'; }
+  pctx.setTransform(dpr, 0, 0, dpr, 0, 0); pctx.clearRect(0, 0, w, h);
+  const z = map.getZoom(), lw = Math.max(1, 0.45 * z - 0.6);
+  const bins = Array.from({ length: 6 }, () => []);
+  for (const P of PARTS) {
+    const q = particleAt(P, t); if (q.alpha < 0.03) continue;
+    bins[Math.min(5, Math.floor(q.alpha * 6))].push(q);
+  }
+  pctx.lineCap = 'round'; pctx.lineWidth = lw;
+  bins.forEach((list, b) => {
+    pctx.strokeStyle = `rgba(255,255,255,${((b + 0.5) / 6 * 0.9).toFixed(3)})`;
+    pctx.beginPath();
+    for (const q of list) { const a = map.project(q.tail), h2 = map.project(q.head); pctx.moveTo(a.x, a.y); pctx.lineTo(h2.x, h2.y); }
+    pctx.stroke();
+  });
+}
+function render(t) {
+  curT = ((t % LOOP) + LOOP) % LOOP;
+  map.setPaintProperty('cells', 'circle-radius', radiusAt(curT));
+  drawParticles(curT);
+}
+let t0 = null;
+function tick(now) {
+  if (!playing) return;
+  if (!window.__ready) { requestAnimationFrame(tick); return; }   // 読み込み前は待つ
+  if (t0 === null) t0 = now - curT * 1000;
+  render((now - t0) / 1000);
+  requestAnimationFrame(tick);
+}
+const bAnim = document.getElementById('bAnim');
+function setPlaying(on) {
+  playing = on; bAnim.textContent = on ? '動きを止める' : '動かす'; bAnim.setAttribute('aria-pressed', !on);
+  if (on) { t0 = null; requestAnimationFrame(tick); }
+}
+setPlaying(playing);
+bAnim.onclick = () => setPlaying(!playing);
+// コマ送り：止めて時刻 t の絵を出し、地図の描画が終わるのを待つ
+window.__frame = t => new Promise(res => {
+  if (playing) setPlaying(false);
+  render(t);
+  // 描画が終われば idle が来る。来ないとき（変化なし等）に止まらないよう 3 秒で打ち切る
+  let fin = false; const ok = () => { if (!fin) { fin = true; res(curT); } };
+  map.once('idle', ok); setTimeout(ok, 3000); map.triggerRepaint();
+});
+// 検証用：その地点で粒が画面上どの方位へ進むか（北=0 時計回り）
+window.__particleBearing = (lon, lat) => {
+  const [dx, dy] = velocity(lon, lat), a = map.project([lon, lat]), b = map.project([lon + dx * 0.05, lat + dy * 0.05]);
+  return (Math.atan2(b.x - a.x, a.y - b.y) * 180 / Math.PI + 360) % 360;
+};
 </script>
 </body>
 </html>
