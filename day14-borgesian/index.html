@@ -1,0 +1,743 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>砂の地図</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IM+Fell+English:ital@0;1&family=IM+Fell+English+SC&family=Shippori+Mincho+B1:wght@500;800&display=block" rel="stylesheet">
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #EDE3CC; }
+  canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }
+  #stop { position: fixed; font-family: "Shippori Mincho B1", serif; font-weight: 500; color: #7A6A55;
+    background: none; border: none; padding: 0 2px; cursor: pointer; letter-spacing: .08em; }
+  #stop:hover, #stop:focus-visible { color: #2A2119; text-decoration: underline; outline: none; }
+  .shot #stop { display: none; }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<canvas id="ink"></canvas>
+<button id="stop" type="button" aria-pressed="false">動きを止める</button>
+<script>
+'use strict';
+// ---- 決まりごと ----------------------------------------------------------
+const L = 25;            // 1 周の秒数
+const K = 5;             // 1 周で寄るオクターブ数（5 秒で 2 倍、1 周で 32 倍）
+const M_PER_PX0 = 50;    // t=0 での基準 1px の長さ（架空、m）
+const FPS = 30;          // 地名の予定表を組む刻み（書き出しのコマと同じ）
+window.LOOP = L;
+const SHADE_K = 40;         // 陰影の強さ（勾配に掛ける）
+const STAIN_T = 0.25;       // 紙のしみのしきい値（面積 8% 前後になるよう測って決めた）
+// capture.mjs は MapLibre の map.areTilesLoaded() を待つ。WebGL 単体なので常に true の代役を置く
+window.map = { areTilesLoaded: () => true };
+const SHOT = new URLSearchParams(location.search).has('shot');
+if (SHOT) document.documentElement.classList.add('shot');
+
+// 地形の窓。シェーダと JS の両方へ同じ数を渡す。
+// 低い側の窓を 4 オクターブ（20 秒）かけて立ち上げる。狭い窓だと最も粗い層が 1 層で分散の半分を持ち、
+// それが消える数秒で陸と海が一斉に入れ替わった（試作の課題 2）
+const TER = { NO: 10, J0: 3, S: 1.0, LO0: -3.0, LO1: 1.0, HI0: 3.5, HI1: 5.5, SEA: 0.05 };
+
+const C = { paper: '#EDE3CC', stain: '#DCCDAA', burn: '#C2A77A', sea: '#C3CDBE', tint: '#D8B57E',
+  ink: '#2A2119', thin: '#7A6A55', red: '#A63A28' };
+const hex3 = h => `vec3(${[1, 3, 5].map(i => (parseInt(h.slice(i, i + 2), 16) / 255).toFixed(4)).join(',')})`;
+const glsl = x => Number.isInteger(x) ? x.toFixed(1) : String(x);
+
+// ---- 地名 ---------------------------------------------------------------
+const NAMES = {
+  land: ['VELLAMORA', 'QUENDALIA', 'CASTRINEA', 'SELVANDRA', 'MIRASTEN', 'TOLVADIA'],
+  sea: ['Mare Paginarum', 'Mare Clepsydrae', 'Sinus Folii', 'Fretum Pulveris', 'Oceanus Sine Fine'],
+  mount: ['Mons Indicis', 'Montes Granorum', 'Mons Velatus', 'Mons Alter'],
+  isle: ['Ins. Nulla Prima', 'Ins. Quintila', 'Ins. Orsenda', 'I. Mendaz', 'Ins. Vespera'],
+};
+const LABEL_STYLE = {
+  land: { font: s => `${s}px "IM Fell English SC"`, ls: 0.35, base: 12, tilt: false },
+  sea: { font: s => `italic ${s}px "IM Fell English"`, ls: 0.2, base: 12, tilt: true },
+  mount: { font: s => `italic ${s}px "IM Fell English"`, ls: 0.08, base: 10, tilt: false },
+  isle: { font: s => `${s}px "IM Fell English"`, ls: 0.08, base: 10, tilt: false },
+};
+const JP_TEXT = '砂の地図最初頁も後無い本のようにこはどこまで寄って底着かない。縮尺架空実在場所ではありません形手続き生成ノイズ第動きを止めるす（）0123456789,';
+
+// ---- 地形（シェーダ） -----------------------------------------------------
+const VS = `#version 300 es
+in vec2 a; void main(){ gl_Position = vec4(a, 0., 1.); }`;
+const FS = `#version 300 es
+precision highp float; precision highp int;
+uniform vec2 uRes; uniform float uPx; uniform float uP; uniform float uTheta; uniform vec2 uCen;
+uniform vec4 uMap; uniform float uShadeK; uniform int uDebug;
+out vec4 o;
+const float K = ${glsl(K)};
+const float STAIN_T = ${glsl(STAIN_T)};
+uint hash(uvec3 x){
+  x = x * 1664525u + 1013904223u;
+  x.x += x.y * x.z; x.y += x.z * x.x; x.z += x.x * x.y;
+  x ^= x >> 16u;
+  x.x += x.y * x.z; x.y += x.z * x.x; x.z += x.x * x.y;
+  return x.x;
+}
+vec2 grad(ivec2 c, uint s){
+  float a = float(hash(uvec3(uvec2(c), s)) >> 8u) * (6.2831853 / 16777216.);
+  return vec2(cos(a), sin(a));
+}
+float gnoise(vec2 p, uint s){
+  vec2 i = floor(p), f = p - i;
+  vec2 u = f * f * f * (f * (f * 6. - 15.) + 10.);
+  ivec2 c = ivec2(i);
+  float a = dot(grad(c, s), f);
+  float b = dot(grad(c + ivec2(1, 0), s), f - vec2(1, 0));
+  float d = dot(grad(c + ivec2(0, 1), s), f - vec2(0, 1));
+  float e = dot(grad(c + ivec2(1, 1), s), f - vec2(1, 1));
+  return mix(mix(a, b, u.x), mix(d, e, u.x), u.y);
+}
+vec2 rot(vec2 v, float a){ float c = cos(a), s = sin(a); return vec2(c * v.x - s * v.y, s * v.x + c * v.y); }
+// シェパード音の地形版。octave i の画面上の細かさは 2^c（c = i - p - J0）。重みは c だけで決まり、
+// 種は i mod K なので、p が K 進むと同じ絵に戻る
+float height(vec2 q){
+  float fp = floor(uP), fr = uP - fp;
+  float sum = 0., norm = 0.;
+  for (int j = 0; j < ${TER.NO}; j++){
+    float c = float(j) - fr - ${glsl(TER.J0)};
+    float sd = mod(fp + float(j), K);
+    float amp = exp2(-c * ${glsl(TER.S)}) * smoothstep(${glsl(TER.LO0)}, ${glsl(TER.LO1)}, c) * (1. - smoothstep(${glsl(TER.HI0)}, ${glsl(TER.HI1)}, c));
+    vec2 P = rot(q, sd * 1.13) * (exp2(c) * 2.2) + vec2(sd * 37.1, sd * -23.7);
+    sum += amp * gnoise(P, uint(sd) + 7u);
+    norm += amp * amp;
+  }
+  return sum / sqrt(norm) - ${glsl(TER.SEA)};
+}
+float hAt(vec2 frag){
+  vec2 uv = (frag - .5 * uRes) / uRes.y;
+  return height(rot(uv - uCen, uTheta));
+}
+// 線の被覆率。d・w は基準 px、AA は装置 px で 1px
+float line(float d, float w){ return clamp(w * .5 * uPx - d * uPx + .5, 0., 1.); }
+// 紙のしみ：横長のノイズを 2 段に量子化。色は紙としみの中間（丸い濃い斑はコーヒーの跡に見える）
+vec3 paper(vec2 ref){
+  float n = gnoise(ref / vec2(380., 140.), 101u) * .7 + gnoise(ref / vec2(150., 60.), 102u) * .3;
+  return n > STAIN_T ? mix(${hex3(C.paper)}, ${hex3(C.stain)}, .5) : ${hex3(C.paper)};
+}
+void main(){
+  vec2 frag = gl_FragCoord.xy;
+  vec2 ref = frag / uPx;                      // 画面に固定した基準 px（版の目）
+  vec3 col = paper(ref);
+  float edge = min(min(ref.x, ref.y), min(uRes.x / uPx - ref.x, uRes.y / uPx - ref.y));
+  if (uDebug == 1){
+    float v = clamp(hAt(frag) * .25 + .5, 0., 1.) * 65535.;
+    o = vec4(floor(v / 256.) / 255., mod(v, 256.) / 255., 0., 1.); return;
+  }
+  bool inMap = all(greaterThan(frag, uMap.xy)) && all(lessThan(frag, uMap.zw));
+  if (inMap){
+    float h = hAt(frag);
+    // 海岸距離 d 用の勾配は 1 基準 px の差分（線の位置を正確に）
+    float hx = hAt(frag + vec2(uPx, 0.)) - h, hy = hAt(frag + vec2(0., uPx)) - h;
+    float g = max(length(vec2(hx, hy)), 1e-6);
+    float d = abs(h) / g;                     // 海岸までの距離（基準 px）。h が 0 に近いだけでも小さくなる
+    // 本当に海岸があるか：16px 先の 8 方向に符号の逆の点があるときだけ。無ければ浅瀬か内陸の低地
+    bool coast = false;
+    if (d < 16.5){
+      for (int k = 0; k < 8; k++){
+        float a = float(k) * .78539816;
+        if ((hAt(frag + vec2(cos(a), sin(a)) * 16. * uPx) < 0.) != (h < 0.)){ coast = true; break; }
+      }
+    }
+    if (h < 0.){
+      col = ${hex3(C.sea)};
+      if (d < 16.5){
+        float k = clamp(floor(d / 3. + .5), 1., 5.);
+        if (coast){
+          vec3 lc = mix(${hex3(C.ink)}, mix(${hex3(C.sea)}, ${hex3(C.thin)}, .3), (k - 1.) / 4.);
+          col = mix(col, lc, line(abs(d - 3. * k), .8));
+        } else if (k < 1.5){                  // 浅瀬は 1 本目だけを薄墨 50% で
+          col = mix(col, mix(${hex3(C.sea)}, ${hex3(C.thin)}, .5), line(abs(d - 3.), .8));
+        }
+      }
+    } else {
+      if (coast) col = mix(col, ${hex3(C.tint)}, .75 * (1. - smoothstep(4., 10., d)));
+      float rise = smoothstep(.18, .40, h);
+      if (rise > 0.){
+        // 陰影用の勾配は ±4px の中心差分。1px 差分だと最も細かい層の凹凸が線の太さに出てモザイクになる
+        float sx = (hAt(frag + vec2(4. * uPx, 0.)) - hAt(frag - vec2(4. * uPx, 0.))) / 8.;
+        float sy = (hAt(frag + vec2(0., 4. * uPx)) - hAt(frag - vec2(0., 4. * uPx))) / 8.;
+        vec3 n = normalize(vec3(-sx * uShadeK, -sy * uShadeK, 1.));
+        float shade = dot(n, normalize(vec3(-1., 1., 1.)));   // 光は左上から
+        float w1 = 3. * clamp((.62 - shade) / .5, 0., .8) * rise;
+        if (w1 < .35) w1 = 0.;                                 // 髪の毛ほどの灰色は出さない
+        float s1 = (ref.x - ref.y) * .70710678;               // 右上→左下の斜線
+        float d1 = abs(fract(s1 / 3. + .5) - .5) * 3.;
+        col = mix(col, ${hex3(C.ink)}, w1 > 0. ? line(d1, w1) : 0.);
+        float w2 = h > .35 ? 3. * clamp((.25 - shade) / .25, 0., .5) * rise : 0.;
+        if (w2 < .35) w2 = 0.;
+        float s2 = (ref.x + ref.y) * .70710678;
+        float d2 = abs(fract(s2 / 3. + .5) - .5) * 3.;
+        col = mix(col, ${hex3(C.ink)}, w2 > 0. ? line(d2, w2) : 0.);
+      }
+    }
+    if (coast) col = mix(col, ${hex3(C.ink)}, line(d, 1.4));
+  }
+  col = mix(${hex3(C.burn)}, col, smoothstep(0., 6., edge));
+  o = vec4(col, 1.);
+}`;
+
+const glc = document.getElementById('gl');
+const gl = glc.getContext('webgl2', { preserveDrawingBuffer: true, antialias: false });
+function sh(type, src){
+  const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, sh(gl.VERTEX_SHADER, VS)); gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, FS));
+gl.linkProgram(prog); gl.useProgram(prog);
+gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+const U = {};
+for (const n of ['uRes', 'uPx', 'uP', 'uTheta', 'uCen', 'uMap', 'uShadeK', 'uDebug']) U[n] = gl.getUniformLocation(prog, n);
+
+// ---- 地形（JS 移植。地名の分類と検証に使う） ------------------------------
+function hash3(x, y, z){
+  x = (Math.imul(x, 1664525) + 1013904223) >>> 0;
+  y = (Math.imul(y, 1664525) + 1013904223) >>> 0;
+  z = (Math.imul(z, 1664525) + 1013904223) >>> 0;
+  x = (x + Math.imul(y, z)) >>> 0; y = (y + Math.imul(z, x)) >>> 0; z = (z + Math.imul(x, y)) >>> 0;
+  x = (x ^ (x >>> 16)) >>> 0; y = (y ^ (y >>> 16)) >>> 0; z = (z ^ (z >>> 16)) >>> 0;
+  x = (x + Math.imul(y, z)) >>> 0; y = (y + Math.imul(z, x)) >>> 0; z = (z + Math.imul(x, y)) >>> 0;
+  return x;
+}
+function gdot(cx, cy, s, fx, fy){
+  const a = (hash3(cx >>> 0, cy >>> 0, s) >>> 8) * (6.2831853 / 16777216);
+  return Math.cos(a) * fx + Math.sin(a) * fy;
+}
+function gnoise(px, py, s){
+  const ix = Math.floor(px), iy = Math.floor(py), fx = px - ix, fy = py - iy;
+  const ux = fx * fx * fx * (fx * (fx * 6 - 15) + 10), uy = fy * fy * fy * (fy * (fy * 6 - 15) + 10);
+  const a = gdot(ix, iy, s, fx, fy), b = gdot(ix + 1, iy, s, fx - 1, fy);
+  const d = gdot(ix, iy + 1, s, fx, fy - 1), e = gdot(ix + 1, iy + 1, s, fx - 1, fy - 1);
+  const m1 = a + (b - a) * ux, m2 = d + (e - d) * ux;
+  return m1 + (m2 - m1) * uy;
+}
+const sstep = (a, b, x) => { const t = Math.min(Math.max((x - a) / (b - a), 0), 1); return t * t * (3 - 2 * t); };
+const rot = (x, y, a) => { const c = Math.cos(a), s = Math.sin(a); return [c * x - s * y, s * x + c * y]; };
+const wrapP = p => ((p % K) + K) % K;
+function heightJS(qx, qy, p){
+  const fp = Math.floor(p), fr = p - fp;
+  let sum = 0, norm = 0;
+  for (let j = 0; j < TER.NO; j++){
+    const c = j - fr - TER.J0;
+    const sd = (fp + j) % K;
+    const amp = Math.pow(2, -c * TER.S) * sstep(TER.LO0, TER.LO1, c) * (1 - sstep(TER.HI0, TER.HI1, c));
+    const [rx, ry] = rot(qx, qy, sd * 1.13);
+    const sc = Math.pow(2, c) * 2.2;
+    sum += amp * gnoise(rx * sc + sd * 37.1, ry * sc + sd * -23.7, sd + 7);
+    norm += amp * amp;
+  }
+  return sum / Math.sqrt(norm) - TER.SEA;
+}
+
+// ---- 時刻だけで決まる量 ----------------------------------------------------
+const theta = t => 7 * Math.PI / 180 * Math.sin(2 * Math.PI * t / L);
+const cen = t => [0.05 * Math.sin(2 * Math.PI * t / L), 0.05 * Math.sin(4 * Math.PI * t / L)];
+// 画面（CSS px、y 下向き）⇄ 地形座標 q
+function toQ(x, y, t, lay){
+  const [cx, cy] = cen(t);
+  return rot((x - lay.W / 2) / lay.H - cx, (lay.H / 2 - y) / lay.H - cy, theta(t));
+}
+function toScreen(qx, qy, t, lay){
+  const [ux, uy] = rot(qx, qy, -theta(t)); const [cx, cy] = cen(t);
+  return [(ux + cx) * lay.H + lay.W / 2, lay.H / 2 - (uy + cy) * lay.H];
+}
+
+// ---- 配置 ---------------------------------------------------------------
+const ink = document.getElementById('ink');
+const ctx = ink.getContext('2d');
+let lay = null, dpr = 1;
+function layout(){
+  const W = innerWidth, H = innerHeight;
+  const phone = W < 600 && H > W;
+  const u = phone ? W / 390 : Math.min(W / 1000, H / 562);
+  const m = phone ? { t: 8, l: 8, r: 8, b: 34 } : { t: 12, l: 12, r: 12, b: 22 };
+  const band = phone ? 4 : 6;
+  const outer = { x: m.l * u, y: m.t * u, r: W - m.r * u, b: H - m.b * u };
+  const inner = { x: outer.x + band * u, y: outer.y + band * u, r: outer.r - band * u, b: outer.b - band * u };
+  const l = { W, H, u, phone, band, outer, inner, maxLabels: phone ? 4 : 5 };
+  // カルトゥーシュ
+  const cx = inner.x + (phone ? 8 : 16) * u, cy = inner.y + (phone ? 8 : 16) * u;
+  const cw = phone ? (inner.r - inner.x) - 16 * u : 300 * u;
+  l.cart = { x: cx, y: cy, w: cw, pad: 14 * u, title: (phone ? 26 : 34) * u };
+  l.cart.lines = wrapJP(DESC, cw - 2 * l.cart.pad, `500 ${12 * u}px "Shippori Mincho B1"`, 0.04 * 12 * u);
+  l.cart.h = l.cart.pad * 2 + l.cart.title * 1.15 + 13 * u * 1.6 + 14 * u + l.cart.lines.length * 12 * u * 1.6 + 12 * u * 1.5;
+  // 方位盤と縮尺
+  const R = (phone ? 28 : 42) * u;
+  l.comp = { x: inner.r - 18 * u - R, y: inner.b - 18 * u - R, R };
+  l.scale = { x: inner.x + 18 * u, w: 150 * u, h: 58 * u };
+  l.scale.y = inner.b - 18 * u - l.scale.h;
+  l.ui = [
+    { x: l.cart.x, y: l.cart.y, r: l.cart.x + l.cart.w, b: l.cart.y + l.cart.h },
+    { x: l.comp.x - R, y: l.comp.y - R, r: l.comp.x + R, b: l.comp.y + R },
+    { x: l.scale.x, y: l.scale.y, r: l.scale.x + l.scale.w, b: l.scale.y + l.scale.h },
+  ];
+  return l;
+}
+const DESC = '最初の頁も最後の頁も無い本のように、この地図はどこまで寄っても底に着かない。';
+function wrapJP(text, maxW, font, ls){
+  ctx.font = font; ctx.letterSpacing = `${ls}px`;
+  const out = []; let cur = '';
+  for (const ch of text){
+    if (ctx.measureText(cur + ch).width > maxW && cur){
+      if ('、。'.includes(ch)){ cur += ch; out.push(cur); cur = ''; continue; } // 句読点を行頭に置かない
+      out.push(cur); cur = ch;
+    } else cur += ch;
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+// ---- 地名の予定表 -------------------------------------------------------
+// 地形の各層（種 sd）が生まれる時刻に、地図の中を 8×5 の格子で調べ、分類ごとに最良の 1 点を候補にする
+// （陸＝海岸から最も遠い点、海＝陸から最も遠い点、山＝最も高い点、島＝小さい陸の最も高い点）。
+// 点は層のノイズ座標に固定なので、地形にぴったり付いて流れる。1 周ぶん（層 i = 4..8、生まれる時刻
+// 0,5,…,20 秒）を 1/30 秒刻みで全部なぞり、見えている間ずっと「文字の箱の 9 点が同じ分類」「枠や
+// ほかの地名と重ならない」を満たす区間だけ出す。前後の周（±25 秒）の写しとも突き合わせるので、絵は周期的に閉じる
+const LIFE = 2.2;           // c=3.0 で生まれ c=0.8 で消える（オクターブ）
+const CLASSES = ['isle', 'mount', 'land', 'sea'];   // 珍しい順に先に場所を取る
+const MOUNT_H = 0.35, LAND_GAP = 120, GRID_SHRINK = 2.2, MOUNT_BOX_H = 0.18;               // 陸の名前どうしは 120 基準 px 以上離す
+function isIsle(qx, qy, p, r = 0.08){ // 小さい陸＝周り 8 方向の r（生まれた時 0.08 画面高）先がほぼ海
+  let seaN = 0;
+  for (let k = 0; k < 8; k++){
+    const a = k * Math.PI / 4;
+    if (heightJS(qx + r * Math.cos(a), qy + r * Math.sin(a), p) < 0) seaN++;
+  }
+  return seaN >= 7;
+}
+// 9 点の判定。山の名前は峰より長いので、9 点とも「斜線の掛かる高み」（h>0.18）にあればよい
+const okClass = (cls, h) => cls === 'sea' ? h < 0 : cls === 'mount' ? h > MOUNT_BOX_H : h >= 0;
+let labelW = {};            // 分類ごとの最も長い名前の幅（基準 1px あたり）
+function measureNames(){
+  for (const [cls, st] of Object.entries(LABEL_STYLE)){
+    ctx.font = st.font(100); ctx.letterSpacing = `${st.ls * 100}px`;
+    labelW[cls] = Math.max(...NAMES[cls].map(n => ctx.measureText(n).width)) / 100;
+  }
+}
+function labelBox(c, n, lay){ // n＝生まれてからのコマ
+  const t = c.tb + n / FPS, a = n / FPS * K / L;
+  const g = Math.pow(2, a);
+  const [x, y] = toScreen(c.qx * g, c.qy * g, t, lay);
+  const st = LABEL_STYLE[c.cls];
+  const s = st.base * lay.u * Math.pow(g, 0.6);
+  const tw = labelW[c.cls] * s, th = s * 0.8;                       // 文字そのものの箱
+  const w = tw + 5 * lay.u, h = s * 1.15 + 5 * lay.u;               // 縁取り 2.5px ぶんを足した箱
+  const ang = st.tilt ? theta(t) - 10 * Math.PI / 180 : 0;
+  const bw = Math.abs(Math.cos(ang)) * w + Math.abs(Math.sin(ang)) * h;
+  const bh = Math.abs(Math.sin(ang)) * w + Math.abs(Math.cos(ang)) * h;
+  return { x, y, s, ang, tw, th, box: { x: x - bw / 2, y: y - bh / 2, r: x + bw / 2, b: y + bh / 2 } };
+}
+// 文字の箱の 9 点（四隅・各辺の中点・中心）が、どれも候補と同じ分類の上にあるか
+function nineOK(c, n, lay, lb){
+  const t = c.tb + n / FPS, p = wrapP(c.pb + n / FPS * K / L);
+  const ca = Math.cos(lb.ang), sa = Math.sin(lb.ang);
+  if (c.cls === 'isle'){ // 島の名前は島より長いので、生まれた時に小島だった点の上に中心が乗っていればよい
+    const [qx, qy] = toQ(lb.x, lb.y, t, lay);
+    return heightJS(qx, qy, p) >= 0;
+  }
+  for (const fx of [-0.5, 0, 0.5]) for (const fy of [-0.5, 0, 0.5]){
+    const dx = fx * lb.tw, dy = fy * lb.th;
+    const [qx, qy] = toQ(lb.x + ca * dx - sa * dy, lb.y + sa * dx + ca * dy, t, lay);
+    if (!okClass(c.cls, heightJS(qx, qy, p))) return false;
+  }
+  return true;
+}
+const hit = (a, b, pad) => a.x < b.r + pad && b.x < a.r + pad && a.y < b.b + pad && b.y < a.b + pad;
+function candidatesFor(i, lay, area){
+  // 格子は寄る中心のまわりに縮めて置く。点は生まれてから 2 倍以上に広がるので、地図全体に置くと
+  // 外側の点はすぐ枠の外へ出てしまう。分類ごとに良い順に並べ、使える最初の 1 点を採る
+  const pb = i - 4, tb = pb * L / K, lists = {};
+  const e = 2 * lay.u / lay.H;                     // 2 基準 px（q の単位は画面高）
+  const [zx, zy] = toScreen(0, 0, tb, lay), hw = (area.r - area.x) / 2 / GRID_SHRINK, hh = (area.b - area.y) / 2 / GRID_SHRINK;
+  for (let a = 0; a < 8; a++) for (let b = 0; b < 5; b++){
+    const x = zx - hw + (a + 0.5) / 8 * 2 * hw, y = zy - hh + (b + 0.5) / 5 * 2 * hh;
+    const [qx, qy] = toQ(x, y, tb, lay);
+    const h = heightJS(qx, qy, pb);
+    const gx = heightJS(qx + e, qy, pb) - heightJS(qx - e, qy, pb), gy = heightJS(qx, qy + e, pb) - heightJS(qx, qy - e, pb);
+    const d = Math.abs(h) / Math.max(Math.hypot(gx, gy) / 4, 1e-6);   // 海岸までの距離（基準 px、近似）
+    const cls = h < 0 ? 'sea' : isIsle(qx, qy, pb) ? 'isle' : h > MOUNT_H ? 'mount' : 'land';
+    const add = (c, score) => (lists[c] = lists[c] || []).push({ cls: c, score, qx, qy });
+    add(cls, cls === 'sea' || cls === 'land' ? d : h);
+    if (cls === 'mount') add('land', d);                                // 山の上も陸の名前の候補
+  }
+  // 小島は 8×5 の目から漏れやすいので、島だけ 16×10 の細かい目でも探す
+  for (let a = 0; a < 16; a++) for (let b = 0; b < 10; b++){
+    const x = zx - hw + (a + 0.5) / 16 * 2 * hw, y = zy - hh + (b + 0.5) / 10 * 2 * hh;
+    const [qx, qy] = toQ(x, y, tb, lay), h = heightJS(qx, qy, pb);
+    if (h > 0.05 && isIsle(qx, qy, pb)) (lists.isle = lists.isle || []).push({ cls: 'isle', score: h, qx, qy });
+  }
+  return CLASSES.filter(c => lists[c]).map(c => ({ cls: c, i, k: CLASSES.indexOf(c), sd: i % K, pb, tb,
+    options: lists[c].sort((p, q) => q.score - p.score) }));
+}
+let schedule = [];
+function buildSchedule(lay){
+  const N = Math.round(LIFE * L / K * FPS), FADE_IN = Math.round(0.4 * L / K * FPS), FADE_OUT = FPS / 2;
+  const pad = 4 * lay.u, inset = 6 * lay.u;
+  const area = { x: lay.inner.x + inset, y: lay.inner.y + inset, r: lay.inner.r - inset, b: lay.inner.b - inset };
+  const groups = [];
+  for (let i = 4; i <= 8; i++) groups.push(...candidatesFor(i, lay, area));
+  groups.sort((a, b) => a.k - b.k || a.tb - b.tb);
+  const accepted = [], cyc = L * FPS, cands = [];
+  for (const g of groups) for (const opt of g.options){
+    const c = { ...g, qx: opt.qx, qy: opt.qy, score: opt.score }; delete c.options;
+    cands.push(c);
+    // 見えてよいコマ：地図の内側、枠の部品に当たらない、9 点が同じ分類
+    const valid = [];
+    for (let n = 0; n <= N; n++){
+      const lb = labelBox(c, n, lay), b = lb.box;
+      valid.push(b.x >= area.x && b.y >= area.y && b.r <= area.r && b.b <= area.b && !lay.ui.some(u => hit(b, u, pad)) && nineOK(c, n, lay, lb));
+    }
+    // 3 秒以上続く最初の区間だけを使う。入りは 2 秒、途中で切れるときは 0.5 秒で消して、切れるコマで 0 にする
+    let n0 = -1, n1 = -1;
+    for (let n = 0; n <= N; n++){
+      if (!valid[n]) continue;
+      let m = n; while (m + 1 <= N && valid[m + 1]) m++;
+      if (m - n >= 3 * FPS){ n0 = n; n1 = m; break; }
+      n = m;
+    }
+    if (n0 < 0){ c.why = 'invalid'; continue; }
+    c.n0 = n0; c.n1 = n1; c.N = N;
+    c.alpha = n => {
+      if (n < c.n0 || n > c.n1) return 0;
+      let a = Math.min(sstep(c.n0, c.n0 + FADE_IN, n), 1 - sstep(N - FADE_IN, N, n));
+      if (c.n1 < N) a = Math.min(a, Math.max(0, (c.n1 - n) / FADE_OUT));
+      return a;
+    };
+    // 他の地名（前後の周の写しを含む）との重なり、陸どうしの間隔、同時に出る数
+    let ok = true;
+    for (let n = c.n0; n <= c.n1 && ok; n++){
+      if (c.alpha(n) <= 0) continue;
+      const lb = labelBox(c, n, lay);
+      const tg = Math.round(c.tb * FPS) + n;
+      let alive = 0;
+      for (const o of accepted) for (const sh of [-cyc, 0, cyc]){
+        const m = tg - Math.round(o.tb * FPS) - sh;
+        if (m < 0 || m > N || o.alpha(m) <= 0) continue;
+        alive++;
+        const ob = labelBox(o, m, lay);
+        if (hit(lb.box, ob.box, pad)) ok = false;
+        if (c.cls === 'land' && o.cls === 'land' && Math.hypot(lb.x - ob.x, lb.y - ob.y) < LAND_GAP * lay.u) ok = false;
+      }
+      if (alive >= lay.maxLabels) ok = false;
+    }
+    if (!ok){ c.why = 'overlap'; continue; }
+    accepted.push(c); c.why = 'ok';
+    break;   // この層・この分類はこの 1 点で決まり
+  }
+  // 周回で一致させる名前：同じ分類の中で生まれ順に名簿を回す
+  accepted.sort((a, b) => a.tb - b.tb || a.k - b.k);
+  const cnt = {};
+  for (const c of accepted){ cnt[c.cls] = (cnt[c.cls] || 0); c.name = NAMES[c.cls][cnt[c.cls]++ % NAMES[c.cls].length]; }
+  window.__cands = cands;
+  return accepted;
+}
+let endless = !SHOT;   // Web で流し続けるときは通算の層番号で名前を選ぶ（二度と同じ並びにしない）
+function labelsAt(t){
+  const tm = ((t % L) + L) % L, out = [];
+  for (const c of schedule) for (const shc of [-1, 0, 1]){
+    const n = Math.round((tm + shc * L - c.tb) * FPS * 1000) / 1000;  // 書き出しのコマでは整数
+    if (n < 0 || n > c.N) continue;
+    const a = c.alpha(n); if (a <= 0) continue;
+    let name = c.name;
+    if (endless){
+      const layer = c.i + K * Math.round((t - n / FPS - c.tb) / L);
+      const list = NAMES[c.cls]; name = list[hash3(layer >>> 0, c.k, 77) % list.length];
+    }
+    out.push({ ...labelBox(c, n, lay), a, cls: c.cls, name });
+  }
+  return out;
+}
+
+// ---- 2D の版（枠・カルトゥーシュ・方位盤・縮尺・地名） ----------------------
+function setFont(f, lsPx){ ctx.font = f; ctx.letterSpacing = `${lsPx}px`; }
+function notchPath(x, y, w, h, n){
+  ctx.beginPath();
+  ctx.moveTo(x + n, y); ctx.lineTo(x + w - n, y); ctx.lineTo(x + w - n, y + n); ctx.lineTo(x + w, y + n);
+  ctx.lineTo(x + w, y + h - n); ctx.lineTo(x + w - n, y + h - n); ctx.lineTo(x + w - n, y + h); ctx.lineTo(x + n, y + h);
+  ctx.lineTo(x + n, y + h - n); ctx.lineTo(x, y + h - n); ctx.lineTo(x, y + n); ctx.lineTo(x + n, y + n); ctx.closePath();
+}
+function drawFrame(){
+  const { u, outer: o, inner: i, band } = lay;
+  const b = band * u, seg = 24 * u;
+  ctx.fillStyle = C.ink;
+  // 目盛りの帯：各辺を 24px ごとに塗り分ける
+  const runs = [[o.x + b, o.y, i.r, o.y + b, 'h'], [o.x + b, i.b, i.r, o.b, 'h'], [o.x, o.y + b, o.x + b, i.b, 'v'], [i.r, o.y + b, o.r, i.b, 'v']];
+  for (const [x0, y0, x1, y1, dir] of runs){
+    const len = dir === 'h' ? x1 - x0 : y1 - y0;
+    for (let s = 0, k = 0; s < len; s += seg, k++){
+      if (k % 2) continue;
+      const e = Math.min(seg, len - s);
+      if (dir === 'h') ctx.fillRect(x0 + s, y0, e, y1 - y0); else ctx.fillRect(x0, y0 + s, x1 - x0, e);
+    }
+  }
+  ctx.fillStyle = C.paper;
+  for (const [x, y] of [[o.x, o.y], [i.r, o.y], [o.x, i.b], [i.r, i.b]]){ ctx.fillRect(x, y, b, b); ctx.strokeStyle = C.ink; ctx.lineWidth = 0.75 * u; ctx.strokeRect(x, y, b, b); }
+  ctx.strokeStyle = C.ink;
+  ctx.lineWidth = 1.5 * u; ctx.strokeRect(o.x, o.y, o.r - o.x, o.b - o.y);
+  ctx.lineWidth = 0.75 * u; ctx.strokeRect(i.x, i.y, i.r - i.x, i.b - i.y);
+}
+function drawCartouche(){
+  const { u } = lay, c = lay.cart;
+  notchPath(c.x, c.y, c.w, c.h, 6 * u); ctx.fillStyle = C.paper; ctx.fill();
+  ctx.strokeStyle = C.ink; ctx.lineWidth = 1.5 * u; ctx.stroke();
+  const g = 3 * u + 1.0 * u;
+  notchPath(c.x + g, c.y + g, c.w - 2 * g, c.h - 2 * g, 6 * u); ctx.lineWidth = 0.5 * u; ctx.stroke();
+  ctx.fillStyle = C.ink; ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+  const mid = c.x + c.w / 2;
+  let y = c.y + c.pad + c.title * 0.92;
+  setFont(`800 ${c.title}px "Shippori Mincho B1"`, 0.2 * c.title);
+  ctx.fillText('砂の地図', mid + 0.1 * c.title, y);
+  y += 13 * u * 1.6;
+  setFont(`${13 * u}px "IM Fell English SC"`, 0.3 * 13 * u);
+  ctx.fillText('Tabula Arenae', mid + 0.15 * 13 * u, y);
+  y += 9 * u;
+  ctx.strokeStyle = C.ink; ctx.lineWidth = 0.5 * u;
+  ctx.beginPath(); ctx.moveTo(c.x + c.pad + 20 * u, y); ctx.lineTo(mid - 7 * u, y); ctx.moveTo(mid + 7 * u, y); ctx.lineTo(c.x + c.w - c.pad - 20 * u, y); ctx.stroke();
+  ctx.fillStyle = C.red; ctx.beginPath(); const dm = 3.5 * u;
+  ctx.moveTo(mid, y - dm); ctx.lineTo(mid + dm, y); ctx.lineTo(mid, y + dm); ctx.lineTo(mid - dm, y); ctx.fill();
+  y += 5 * u;
+  ctx.fillStyle = C.ink; ctx.textAlign = 'left';
+  setFont(`500 ${12 * u}px "Shippori Mincho B1"`, 0.04 * 12 * u);
+  for (const ln of c.lines){ y += 12 * u * 1.6; ctx.fillText(ln, c.x + c.pad, y); }
+  y += 12 * u * 1.6;
+  ctx.fillStyle = C.thin; setFont(`${12 * u}px "IM Fell English"`, 0.02 * 12 * u);
+  ctx.fillText('#30DayMapChallenge Day 14: Borgesian map', c.x + c.pad, y);
+}
+function drawCompass(t){
+  const { u } = lay, { x, y, R } = lay.comp, k = R / 42;
+  ctx.save(); ctx.translate(x, y); ctx.rotate(theta(t));
+  ctx.strokeStyle = C.ink; ctx.lineWidth = 0.5 * u;
+  ctx.beginPath();
+  for (let j = 0; j < 32; j++){ const a = j * Math.PI / 16; ctx.moveTo(Math.sin(a) * R * 0.5, -Math.cos(a) * R * 0.5); ctx.lineTo(Math.sin(a) * R, -Math.cos(a) * R); }
+  ctx.stroke();
+  ctx.beginPath(); ctx.arc(0, 0, R, 0, 2 * Math.PI); ctx.stroke();
+  ctx.fillStyle = C.paper; ctx.beginPath(); ctx.arc(0, 0, 20 * k * u, 0, 2 * Math.PI); ctx.fill();
+  const pt = (a, len, base, colr) => { // とがり 1 本＝左半分を塗り、右半分は線
+    const tip = [Math.sin(a) * len, -Math.cos(a) * len];
+    const l = [Math.sin(a - Math.PI / 4) * base, -Math.cos(a - Math.PI / 4) * base];
+    const r = [Math.sin(a + Math.PI / 4) * base, -Math.cos(a + Math.PI / 4) * base];
+    ctx.fillStyle = C.paper; ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(...l); ctx.lineTo(...tip); ctx.lineTo(...r); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = colr; ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(...l); ctx.lineTo(...tip); ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = colr; ctx.lineWidth = 0.6 * u; ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(...l); ctx.lineTo(...tip); ctx.lineTo(...r); ctx.closePath(); ctx.stroke();
+  };
+  for (let j = 0; j < 4; j++) pt(Math.PI / 4 + j * Math.PI / 2, R * 0.62, R * 0.12, C.ink);
+  for (let j = 3; j >= 0; j--) pt(j * Math.PI / 2, R * 0.96, R * 0.16, j === 0 ? C.red : C.ink);
+  ctx.restore();
+}
+const PREFIX = [[3, 'km'], [0, 'm'], [-3, 'mm'], [-6, 'µm'], [-9, 'nm'], [-12, 'pm'], [-15, 'fm'],
+  [-18, 'am'], [-21, 'zm'], [-24, 'ym'], [-27, 'rm'], [-30, 'qm']];
+const BAR = 100; // 縮尺バーの最大幅（基準 px）
+// 縮尺は log10 で持つ。倍率 2^t をそのまま持つと約 1000 周で double が 0 に潰れる
+function scaleAt(t){
+  const target = Math.log10(BAR * M_PER_PX0) - t * K / L * Math.LOG10E * Math.LN2;   // 100px ぶんの長さ
+  const e = Math.floor(target), m = Math.pow(10, target - e);
+  const nice = m >= 5 ? 5 : m >= 2 ? 2 : 1;
+  const unit = PREFIX.find(([pe]) => e >= pe);
+  const num = unit ? (nice * Math.pow(10, e - unit[0])).toLocaleString('en-US') : `${nice}×10^${e}`;
+  const uname = unit ? unit[1] : 'm';
+  // 単位が変わった瞬間（target が 3 の倍数を下に越えた時刻）から 1 秒だけ朱
+  const g = unit ? Math.floor(e / 3) * 3 + 3 : e + 1;
+  const tCross = (Math.log10(BAR * M_PER_PX0) - g) / (K / L * Math.LOG10E * Math.LN2);
+  const red = unit && t - tCross >= 0 && t - tCross < 1;
+  // 縮尺の分数（基準 1px ＝ 0.2646 mm）。1:1 を越えたら逆転させる
+  const lr = Math.log10(M_PER_PX0 / 0.0002646) - t * K / L * Math.LOG10E * Math.LN2;
+  const big = l => { const v = Math.round(Math.pow(10, l)); const s = Number(v.toPrecision(3)); return s.toLocaleString('en-US'); };
+  const frac = lr >= 0 ? (lr < 12 ? `1 : ${big(lr)}` : `1 : 10^${Math.floor(lr)}`) : (-lr < 12 ? `${big(-lr)} : 1` : `10^${Math.floor(-lr)} : 1`);
+  return { num, uname, red, w: nice * Math.pow(10, e - target) * BAR, frac };
+}
+function drawScale(t){
+  const { u } = lay, s = lay.scale, sc = scaleAt(t);
+  ctx.fillStyle = C.paper; ctx.fillRect(s.x, s.y, s.w, s.h);
+  ctx.strokeStyle = C.ink; ctx.lineWidth = 0.75 * u; ctx.strokeRect(s.x, s.y, s.w, s.h);
+  const bx = s.x + 10 * u, by = s.y + 28 * u, bw = sc.w * u, bh = 5 * u;
+  for (let j = 0; j < 5; j++){ ctx.fillStyle = j % 2 ? C.paper : C.ink; ctx.fillRect(bx + bw * j / 5, by, bw / 5, bh); }
+  ctx.strokeRect(bx, by, bw, bh);
+  ctx.textBaseline = 'alphabetic';
+  setFont(`${15 * u}px "IM Fell English"`, 0.05 * 15 * u);
+  ctx.fillStyle = C.ink; ctx.textAlign = 'center'; ctx.fillText('0', bx, by - 6 * u);
+  ctx.textAlign = 'right';
+  const unitW = ctx.measureText(' ' + sc.uname).width;
+  const right = Math.max(bx + bw + 8 * u, bx + 30 * u + ctx.measureText(sc.num).width + unitW);
+  ctx.fillStyle = sc.red ? C.red : C.ink; ctx.fillText(' ' + sc.uname, right, by - 6 * u);
+  ctx.fillStyle = C.ink; ctx.fillText(sc.num, right - unitW, by - 6 * u);
+  ctx.textAlign = 'left'; ctx.fillStyle = C.thin;
+  setFont(`500 ${11 * u}px "Shippori Mincho B1"`, 0.08 * 11 * u);
+  ctx.fillText('縮尺（架空）', bx, s.y + s.h - 9 * u);
+  ctx.textAlign = 'right'; setFont(`${11 * u}px "IM Fell English"`, 0.05 * 11 * u);
+  ctx.fillText(sc.frac, s.x + s.w - 8 * u, s.y + s.h - 9 * u);
+}
+function pageAt(t){ return ((Math.floor(t / L) * 7919 + 40514) % 99991).toLocaleString('en-US'); }
+function drawMargins(t){
+  const { u, outer: o, W, H } = lay;
+  ctx.fillStyle = C.thin; ctx.textBaseline = 'alphabetic';
+  setFont(`500 ${11 * u}px "Shippori Mincho B1"`, 0.08 * 11 * u);
+  const page = `第 ${pageAt(t)} 頁`;
+  if (lay.phone){
+    const y1 = o.b + 14 * u, y2 = o.b + 28 * u;
+    ctx.textAlign = 'left';
+    ctx.fillText('実在の場所ではありません', o.x, y1);
+    ctx.fillText('地形は手続き生成（fBm ノイズ）', o.x, y2);
+    ctx.textAlign = 'right'; ctx.fillText(page, o.r, y1);
+  } else {
+    const y = o.b + 15 * u;
+    ctx.textAlign = 'left'; ctx.fillText('実在の場所ではありません', o.x, y);
+    ctx.textAlign = 'right'; ctx.fillText('地形は手続き生成（fBm ノイズ）', o.r, y);
+    ctx.textAlign = 'center'; ctx.fillText(page, W / 2, y);   // 左右の注記と並べて下の余白の中央に
+  }
+}
+function drawLabels(t){
+  const { u } = lay;
+  for (const lb of labelsAt(t)){
+    const st = LABEL_STYLE[lb.cls];
+    ctx.save(); ctx.globalAlpha = lb.a; ctx.translate(lb.x, lb.y); ctx.rotate(lb.ang);
+    setFont(st.font(lb.s), st.ls * lb.s);
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.lineJoin = 'round'; ctx.lineWidth = 5 * u; ctx.strokeStyle = C.paper;
+    // letterSpacing は末尾にも字間が付くので半分ずらして中央に置く
+    const dx = st.ls * lb.s / 2;
+    ctx.strokeText(lb.name, dx, 0);
+    ctx.fillStyle = C.ink; ctx.fillText(lb.name, dx, 0);
+    ctx.restore();
+  }
+}
+
+// ---- 描画 ---------------------------------------------------------------
+function resize(){
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.round(innerWidth * dpr), h = Math.round(innerHeight * dpr);
+  for (const c of [glc, ink]) if (c.width !== w || c.height !== h){ c.width = w; c.height = h; }
+  lay = layout();
+  measureNames();
+  schedule = buildSchedule(lay);
+  placeButton();
+}
+function placeButton(){
+  const b = document.getElementById('stop'), { u, outer: o } = lay;
+  b.style.fontSize = `${11 * u}px`;
+  if (lay.phone){ b.style.left = 'auto'; b.style.right = `${innerWidth - o.r}px`; b.style.top = `${o.b + 17 * u}px`; b.style.transform = 'none'; }
+  else { // 中央の頁番号と右の注記の間
+    setFont(`500 ${11 * u}px "Shippori Mincho B1"`, 0.08 * 11 * u);
+    const rightStart = o.r - ctx.measureText('地形は手続き生成（fBm ノイズ）').width;
+    b.style.left = `${(lay.W / 2 + rightStart) / 2}px`; b.style.right = 'auto'; b.style.top = `${o.b + 4 * u}px`; b.style.transform = 'translateX(-50%)';
+  }
+}
+function drawGL(t, debug = 0){
+  const p = wrapP(t * K / L);   // 1 周ごとに折り返す。シェーダに渡す数は常に [0, K)
+  const [cx, cy] = cen(t), i = lay.inner;
+  gl.viewport(0, 0, glc.width, glc.height);
+  gl.uniform2f(U.uRes, glc.width, glc.height);
+  gl.uniform1f(U.uPx, lay.u * dpr);
+  gl.uniform1f(U.uP, p); gl.uniform1f(U.uTheta, theta(t)); gl.uniform2f(U.uCen, cx, cy);
+  gl.uniform4f(U.uMap, i.x * dpr, (lay.H - i.b) * dpr, i.r * dpr, (lay.H - i.y) * dpr);
+  gl.uniform1f(U.uShadeK, SHADE_K);
+  gl.uniform1i(U.uDebug, debug);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+function draw(t){
+  drawGL(t);
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.clearRect(0, 0, ink.width, ink.height);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.save(); ctx.beginPath(); const i = lay.inner; ctx.rect(i.x, i.y, i.r - i.x, i.b - i.y); ctx.clip();
+  drawLabels(t);
+  ctx.restore();
+  drawFrame(); drawCartouche(); drawCompass(t); drawScale(t); drawMargins(t);
+}
+
+// ---- 動き ---------------------------------------------------------------
+const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+let paused = reduce || SHOT, manual = false, tNow = 0, last = null;
+const btn = document.getElementById('stop');
+function setPaused(v){ paused = v; btn.textContent = v ? '動かす' : '動きを止める'; btn.setAttribute('aria-pressed', String(v)); last = null; }
+btn.addEventListener('click', () => setPaused(!paused));
+function loop(now){
+  if (manual) return;
+  if (!paused && last !== null) tNow += (now - last) / 1000;
+  last = now;
+  draw(tNow);
+  requestAnimationFrame(loop);
+}
+window.__ready = (async () => {
+  const jp = JP_TEXT + DESC;
+  await Promise.all([
+    document.fonts.load('800 34px "Shippori Mincho B1"', '砂の地図'),
+    document.fonts.load('500 12px "Shippori Mincho B1"', jp),
+    document.fonts.load('12px "IM Fell English"', 'Aa0'),
+    document.fonts.load('italic 12px "IM Fell English"', 'Aa'),
+    document.fonts.load('12px "IM Fell English SC"', 'Aa'),
+  ]);
+  await document.fonts.ready;
+  resize();
+  setPaused(paused);
+  requestAnimationFrame(loop);
+  addEventListener('resize', () => { resize(); if (manual) draw(tNow); });
+  return true;
+})();
+// 時刻 t の絵を描き、フォントと描画が済んだら resolve する。呼んだら rAF のループは止める
+window.__frame = async t => {
+  await window.__ready; await document.fonts.ready;
+  manual = true; endless = false; tNow = t;
+  draw(t);
+  const px = new Uint8Array(4); gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+  await new Promise(r => { requestAnimationFrame(() => r()); setTimeout(r, 200); });
+};
+
+// ---- 検証用（画面には出ない） ------------------------------------------------
+window.__dbg = {
+  heightJS, toQ, labelsAt, scaleAt, get lay(){ return lay; }, get schedule(){ return schedule; },
+  // シェーダの h を読み戻す（R,G に 16bit で詰めてある）
+  shaderH(points, t){
+    drawGL(t, 1);
+    return points.map(([x, y]) => {
+      const b = new Uint8Array(4);
+      gl.readPixels(Math.floor(x * dpr), Math.floor((lay.H - y) * dpr), 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, b);
+      const v = (b[0] * 256 + b[1]) / 65535;
+      const q = toQ(Math.floor(x * dpr) / dpr + 0.5 / dpr, lay.H - (Math.floor((lay.H - y) * dpr) + 0.5) / dpr, t, lay);
+      return { x, y, shader: (v - 0.5) * 4, js: heightJS(q[0], q[1], wrapP(t * K / L)) };
+    });
+  },
+  // 陸⇄海の入れ替わり率。地形に付いて 1 秒追い、符号が変わった点の割合（画面の格子で数える）
+  flipRate(t, dt = 1, nx = 160, ny = 90){
+    let flip = 0, n = 0; const g = Math.pow(2, dt * K / L);
+    for (let a = 0; a < nx; a++) for (let b = 0; b < ny; b++){
+      const x = lay.inner.x + (a + 0.5) / nx * (lay.inner.r - lay.inner.x), y = lay.inner.y + (b + 0.5) / ny * (lay.inner.b - lay.inner.y);
+      const [qx, qy] = toQ(x, y, t, lay);
+      const h0 = heightJS(qx, qy, wrapP(t * K / L)), h1 = heightJS(qx * g, qy * g, wrapP((t + dt) * K / L));
+      if ((h0 < 0) !== (h1 < 0)) flip++; n++;
+    }
+    return flip / n;
+  },
+  // 陸のうち斜線が掛からず紙の地のまま残る割合（シェーダと同じ式を JS でなぞる）
+  paperLandFraction(t, nx = 160, ny = 90){
+    let land = 0, plain = 0; const p = wrapP(t * K / L), e = 4 * lay.u / lay.H;
+    for (let a = 0; a < nx; a++) for (let b = 0; b < ny; b++){
+      const x = lay.inner.x + (a + 0.5) / nx * (lay.inner.r - lay.inner.x), y = lay.inner.y + (b + 0.5) / ny * (lay.inner.b - lay.inner.y);
+      const [qx, qy] = toQ(x, y, t, lay), h = heightJS(qx, qy, p);
+      if (h < 0) continue; land++;
+      const rise = sstep(0.18, 0.40, h);
+      if (rise <= 0){ plain++; continue; }
+      // 画面の右・上（y 上向き）へ 4px。q は画面を θ 回した座標なので、画面の軸を回して差を取る
+      const [ax, ay] = rot(e, 0, theta(t)), [bx, by] = rot(0, e, theta(t));
+      const sx = (heightJS(qx + ax, qy + ay, p) - heightJS(qx - ax, qy - ay, p)) / 8;
+      const sy = (heightJS(qx + bx, qy + by, p) - heightJS(qx - bx, qy - by, p)) / 8;
+      const n = [-sx * SHADE_K, -sy * SHADE_K, 1], nl = Math.hypot(...n);
+      const shade = (-n[0] + n[1] + n[2]) / nl / Math.sqrt(3);
+      const w1 = 3 * Math.min(Math.max((0.62 - shade) / 0.5, 0), 0.8) * rise;
+      if (w1 < 0.35) plain++;
+    }
+    return plain / land;
+  },
+  stainFraction(){
+    let s = 0, n = 0;
+    for (let x = 0; x < 1000; x += 4) for (let y = 0; y < 562; y += 4){ const v = gnoise(x / 380, y / 140, 101) * .7 + gnoise(x / 150, y / 60, 102) * .3; if (v > STAIN_T) s++; n++; }
+    return s / n;
+  },
+};
+</script>
+</body>
+</html>
