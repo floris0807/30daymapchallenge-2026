@@ -1,0 +1,626 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>足の下の星座 — Planisphaerium Subterraneum</title>
+<meta name="description" content="#30DayMapChallenge Day 15: Inside out. 日本の地下から見上げた20年分の震源を古い星図として描く。深い地震ほど西にあり、切ると沈む板が現れる。">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IM+Fell+English:ital@0;1&family=IM+Fell+English+SC&family=Shippori+Mincho+B1:wght@500;700;800&display=block" rel="stylesheet">
+<style>
+  html, body { margin: 0; background: #EDE3CC; }
+  body.wide { height: 100vh; overflow: hidden; }
+  canvas { display: block; }
+  body.wide canvas { position: fixed; inset: 0; }
+  #stop { position: absolute; font-family: "Shippori Mincho B1", serif; font-weight: 500; font-size: 12px; color: #7A6A55;
+    background: none; border: none; padding: 2px 4px; cursor: pointer; letter-spacing: .08em; z-index: 2; }
+  #stop:hover, #stop:focus-visible { color: #2A2119; text-decoration: underline; outline: none; }
+  .shot #stop { display: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<button id="stop" type="button" aria-pressed="false">動きを止める</button>
+<script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/topojson-client@3.1.0/dist/topojson-client.min.js"></script>
+<script>
+'use strict';
+// capture.mjs は MapLibre の map.areTilesLoaded() を待つ。地図ライブラリを使わないので常に true の代役を置く
+window.map = { areTilesLoaded: () => true };
+const SHOT = new URLSearchParams(location.search).has('shot');
+if (SHOT) document.documentElement.classList.add('shot');
+
+// ---- 決まりごと ----------------------------------------------------------
+const L = 30; window.LOOP = L;                 // 1 周の秒数
+const RE = 6371;                               // 地球の平均半径 km
+const CAM = { lon: 138.5, lat: 35.5, depth: 1800, orbit: 55 };   // 視点の軌道（中心・半径 km）。半径は視差の振れ幅の条件から決めた
+const TARGET = [138.5, 36.5];                  // 見上げる地表の点
+const CEIL_CLIP = 28;                          // 天井を描く範囲（見上げる点からの角距離、度）。これより外は視点の背後に近い
+const SEC_KM = 2100, SEC_DEPTH = 700, SEC_LON0 = 138.5;   // 断面：横 2,100 km（中心 138.5°E）× 深さ 700 km、縦横同じ縮尺
+const HALF = 2;                                // 帯の半幅（度）
+const STOPS = [                                 // 帯の停止。φ は中央緯度
+  { name: '北海道・千島', phi: 44, t0: -1, t1: 3 },
+  { name: '東北', phi: 39, t0: 6, t1: 14 },
+  { name: '伊豆・小笠原', phi: 29, t0: 22, t1: 28 },
+];
+const C = { paper: '#EDE3CC', ink: '#2A2119', sumi: '#7A6A55', ai: '#15213F', aiLand: '#1D2B50', line: '#D9C9A3',
+  shallow: '#A39A82', mid: '#E2BE5E', deep: '#CDEAF6', shuAi: '#E8694A', shuPaper: '#A63A28' };
+const JP = '"Shippori Mincho B1", serif', FELL = '"IM Fell English", serif', FELLSC = '"IM Fell English SC", serif';
+const DESC = '日本の地下 約1,800 km から見上げた、20 年分の震源（M4.5 以上、14,243 件）。深い星ほど西にあり、切ると沈む板が現れる。';
+const NOTE = '限界：深さには震源決定の誤差がある。深さが決まらず 10 km ちょうど（全体の 22%）、35 km ちょうど（1,243 件）の固定値にされた記録を含み、浅い側の深さの細部は読めない。M4.5 未満は含まない。傾きは深さ 70 km 超の点への直線の当てはめで、東西に切った見かけの値。';
+const ICHI_H = '一　見上げる', ICHI_T = '── 足の下 約1,800 km から。夜空の星図と同じく、見上げる地図は東が左';
+const PLACES = [['東京', 139.69, 35.69], ['札幌', 141.35, 43.06], ['福岡', 130.40, 33.59], ['ソウル', 126.98, 37.57]];
+const SEAS = [['太平洋', 146, 31], ['日本海', 135, 40.5]];
+
+const rad = Math.PI / 180;
+const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+const ease = x => 0.5 - 0.5 * Math.cos(Math.PI * clamp(x, 0, 1));
+const kmPerDeg = phi => 111.32 * Math.cos(phi * rad);
+const depthClass = d => d <= 70 ? 0 : d <= 300 ? 1 : 2;
+const magR = m => m < 5 ? 1.1 : m < 6 ? 1.8 : m < 7 ? 2.8 : 4.2;
+const STAR_COL = [C.shallow, C.mid, C.deep], STAR_A = [0.35, 0.9, 1];
+
+// ---- 帯の動き（t だけで決まる） -------------------------------------------
+function bandAt(t) {
+  const u = ((t % L) + L) % L;
+  let phi, a = 1;
+  if (u < 3) phi = 44;
+  else if (u < 6) phi = 44 - 5 * ease((u - 3) / 3);
+  else if (u < 14) phi = 39;
+  else if (u < 22) phi = 39 - 10 * ease((u - 14) / 8);
+  else if (u < 29) { phi = 29; if (u >= 28) a = 1 - (u - 28); }
+  else { phi = 44; a = u - 29; }
+  // 停止中の数字：入って 0.4 秒でフェードイン、出る 0.4 秒前にフェードアウト（北海道は 29 秒から始まる停止）
+  let stop = null, na = 0;
+  for (const s of STOPS) {
+    const v = (s.t0 < 0 && u >= 29) ? u - L : u;
+    if (v >= s.t0 && v <= s.t1) { stop = s; na = clamp((v - s.t0) / 0.4, 0, 1) * clamp((s.t1 - v) / 0.4, 0, 1); }
+  }
+  return { phi, a, stop, na };
+}
+
+// ---- 地心直交座標と視点 ----------------------------------------------------
+function ecef(lon, lat, depth = 0) {
+  const r = RE - depth, cl = Math.cos(lat * rad);
+  return [r * cl * Math.cos(lon * rad), r * cl * Math.sin(lon * rad), r * Math.sin(lat * rad)];
+}
+const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const norm = a => { const l = Math.hypot(...a); return [a[0] / l, a[1] / l, a[2] / l]; };
+const east = lon => [-Math.sin(lon * rad), Math.cos(lon * rad), 0];
+const north = (lon, lat) => [-Math.sin(lat * rad) * Math.cos(lon * rad), -Math.sin(lat * rad) * Math.sin(lon * rad), Math.cos(lat * rad)];
+let cam, CX = 0, CY = 0, F = 1, ZREF = 1;
+// 標準の lookAt（right = 前方 × 北）。地下から北を上にして見上げると right は西を向き、東西は自然に逆になる
+function setCamera(t) {
+  const th = 2 * Math.PI * (((t % L) + L) % L) / L;
+  const c0 = ecef(CAM.lon, CAM.lat, CAM.depth), E = east(CAM.lon), N = north(CAM.lon, CAM.lat);
+  const pos = c0.map((v, i) => v + CAM.orbit * (Math.cos(th) * E[i] + Math.sin(th) * N[i]));
+  const tp = ecef(...TARGET), f = norm(sub(tp, pos)), right = norm(cross(f, north(...TARGET)));
+  cam = { pos, f, right, up: cross(right, f) };
+  ZREF = dot(sub(tp, pos), f);
+}
+function project(p) {
+  const v = sub(p, cam.pos), z = dot(v, cam.f);
+  if (z < 50) return null;
+  return [CX + F * dot(v, cam.right) / z, CY - F * dot(v, cam.up) / z, z];
+}
+// 天井（深さ 0）を d3 の投影として包む：見上げる点を中心に 28° で球面のまま切ってから透視に通す
+const unrot = d3.geoRotation([-TARGET[0], -TARGET[1]]);
+// d3 は作るときに raw(0,0) で中心を測って平行移動に焼き込む。見上げる点は常に画面中心に来るので、
+// 中心からの相対で返し、平行移動は translate([CX, CY]) に任せる
+function ceilRaw(l, p) {
+  if (!cam) return [0, 0];
+  const [lon, lat] = unrot.invert([l / rad, p / rad]);
+  const s = project(ecef(lon, lat)) || [CX, CY];
+  return [s[0] - CX, CY - s[1]];
+}
+const ceil = d3.geoProjection(ceilRaw).rotate([-TARGET[0], -TARGET[1]]).clipAngle(CEIL_CLIP)
+  .scale(1).translate([0, 0]).precision(0.4);
+
+// ---- データと集計 -----------------------------------------------------------
+let Q, land, coast, stats, deepest;
+// 断面の窓（中心 138.5°E から東西 1,050 km）に入るか
+const inWindow = (lon, phi) => Math.abs((lon - SEC_LON0) * kmPerDeg(phi)) <= SEC_KM / 2;
+function fitBand(q, phi) {
+  const k = kmPerDeg(phi);
+  const s = q.filter(r => Math.abs(r[1] - phi) <= HALF && r[2] > 70 && inWindow(r[0], phi));
+  if (s.length < 3) return { n: s.length };
+  const xs = s.map(r => (r[0] - SEC_LON0) * k), ys = s.map(r => r[2]);
+  const mx = d3.mean(xs), my = d3.mean(ys);
+  const sxy = d3.sum(xs, (x, i) => (x - mx) * (ys[i] - my)), sxx = d3.sum(xs, x => (x - mx) ** 2), syy = d3.sum(ys, y => (y - my) ** 2);
+  const slope = sxy / sxx, r = sxy / Math.sqrt(sxx * syy);
+  return { n: s.length, slope, icpt: my - slope * mx, r, dip: Math.atan(-slope) / rad, maxDepth: d3.max(ys),
+    show: Math.abs(r) >= 0.9 && s.length >= 30 };
+}
+function computeStats(q) {
+  const band = [0, 0, 0], west = [0, 0, 0];
+  for (const r of q) { const c = depthClass(r[2]); band[c]++; if (r[0] < 140) west[c]++; }
+  const d = q.reduce((a, b) => b[2] > a[2] ? b : a);
+  return { n: q.length, band, westShare: west.map((w, i) => w / band[i]),
+    deepest: { lon: d[0], lat: d[1], depth: d[2], mag: d[3], year: Math.floor(d[4]), id: d[5] },
+    fixed10: q.filter(r => r[2] === 10).length, fixed35: q.filter(r => r[2] === 35).length,
+    stops: STOPS.map(s => ({ name: s.name, lo: s.phi - HALF, hi: s.phi + HALF, ...fitBand(q, s.phi) })) };
+}
+
+// ---- レイアウト -------------------------------------------------------------
+const canvas = document.getElementById('c'), ctx = canvas.getContext('2d');
+let W, H, dpr, wide, lay;
+function wrapLines(text, font, maxW) {
+  // 英数字の連なり（−0.98 など）は割らない。句読点・閉じ括弧は行頭に置かない（前の行へぶら下げる）
+  ctx.font = font; const out = []; let cur = '';
+  for (const tk of text.match(/[A-Za-z0-9.,%−+°|〜-]+|./gu)) {
+    if (ctx.measureText(cur + tk).width > maxW && cur && !/^[、。）」，．]/.test(tk)) { out.push(cur); cur = tk.trimStart(); }
+    else cur += tk;
+  }
+  if (cur) out.push(cur); return out;
+}
+function resize() {
+  dpr = Math.min(devicePixelRatio || 1, 2);
+  W = innerWidth; const vh = innerHeight;
+  wide = W / vh >= 1.45 && W >= 1100;
+  document.body.classList.toggle('wide', wide);
+  if (wide) {
+    H = vh; const u = Math.min(W / 1600, H / 900);
+    lay = { wide: true, u, ox: (W - 1600 * u) / 2, oy: (H - 900 * u) / 2, w: 1600, h: 900,
+      circle: { x: 480, y: 438, R: 360 }, ichi: { y: 868 },
+      head: { x: 940, y: 60, w: 620 }, ni: { x: 940, y: 250, w: 620 },
+      san: { x: 940, y: 436, w: 620 }, legend: { x: 940, y: 748 }, note: { x: 940, y: 778, w: 620 },
+      src: { x: 940, y: 858, w: 620 } };
+  } else {
+    // 1 列（最大 720px）。上から：題・説明 → 円 → 一 → 三 → 二 → 凡例・注記・出典
+    const colW = Math.min(720, W - 48), x = (W - colW) / 2, mob = colW < 500;
+    let y = 40; const L0 = {};
+    const titleSize = mob ? 26 : 40;
+    L0.head = { x, y, w: colW, titleSize };
+    const descLines = wrapLines(DESC, `500 ${mob ? 14 : 16}px ${JP}`, colW).length;
+    y += titleSize + 8 + 18 + 20 + 6 + descLines * (mob ? 23 : 26) + 24;
+    const R = colW / 2 - 14 - 46;   // 輪 14px と、左右に回したラテン語の方位ぶん
+    L0.circle = { x: W / 2, y: y + R + 14 + 30, R };
+    y = L0.circle.y + R + 14 + 34;
+    const ichiLines = wrapLines(ICHI_T, `500 13px ${JP}`, colW).length;
+    L0.ichi = { y: y + 6, lines: ichiLines }; y += 22 + ichiLines * 20 + 18;
+    const secDW = colW - 40, secDH = secDW / 3;
+    L0.san = { x, y, w: colW, dw: secDW, dh: secDH }; y += 44 + secDH + 64 + 24;
+    L0.ni = { x, y, w: colW, mob }; y += mob ? 270 : 190;
+    L0.legend = { x, y }; y += 30;
+    const noteLines = wrapLines(NOTE, `500 11.5px ${JP}`, colW).length;
+    L0.note = { x, y, w: colW }; y += noteLines * 18 + 14;
+    L0.src = { x, y, w: colW }; y += 60;
+    H = Math.ceil(y + 30);
+    lay = { wide: false, u: 1, ox: 0, oy: 0, w: W, h: H, ...L0 };
+  }
+  canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr);
+  canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+  // 円の大きさに合わせて焦点距離を決める（地表の日本列島が円の 2/3 ほどに入る）
+  CX = lay.circle.x; CY = lay.circle.y; F = lay.circle.R * 1.0; ceil.translate([CX, CY]);
+  const b = document.getElementById('stop');
+  if (wide) { b.style.left = (lay.ox + 1556 * lay.u - 110) + 'px'; b.style.top = (lay.oy + 30 * lay.u) + 'px'; }
+  else { b.style.left = (W - 16 - 110) + 'px'; b.style.top = '12px'; }
+}
+
+// ---- 描画の部品 -------------------------------------------------------------
+function text(s, x, y, font, color, align = 'left', spacing = 0) {
+  ctx.font = font; ctx.fillStyle = color; ctx.textAlign = align; ctx.textBaseline = 'alphabetic';
+  ctx.letterSpacing = spacing + 'px'; ctx.fillText(s, x, y); ctx.letterSpacing = '0px';
+}
+function drawFrame() {
+  const { w, h } = lay;
+  ctx.strokeStyle = C.ink;
+  const m = lay.wide ? 20 : 8;
+  ctx.lineWidth = 1.5; ctx.strokeRect(m, m, w - 2 * m, h - 2 * m);
+  ctx.lineWidth = 0.5; ctx.strokeRect(m + 5.5, m + 5.5, w - 2 * m - 11, h - 2 * m - 11);
+}
+function starPath(x, y, r) { ctx.beginPath(); ctx.arc(x, y, r, 0, 6.2832); }
+function drawStar(x, y, r, cls, alpha) {
+  ctx.globalAlpha = STAR_A[cls] * alpha;
+  if (cls === 2) {  // 深い星：光芒 → 藍の縁 → 塗り → 白抜きの輪
+    ctx.globalAlpha = 0.10 * alpha; ctx.fillStyle = C.deep; starPath(x, y, r * 2.5); ctx.fill();
+    ctx.globalAlpha = alpha;
+  }
+  if (cls > 0) { ctx.strokeStyle = C.ai; ctx.lineWidth = 0.75 * 2; starPath(x, y, r); ctx.stroke(); }
+  ctx.fillStyle = STAR_COL[cls]; starPath(x, y, r); ctx.fill();
+  if (cls === 2) { ctx.strokeStyle = C.deep; ctx.lineWidth = 0.6; starPath(x, y, r + 1.5); ctx.stroke(); }
+}
+
+// 天井の経線・緯線と円の交点（輪の目盛り、引き出し線、三角に使う）
+function circleCrossings(line) {
+  const { x: cx, y: cy, R } = lay.circle, out = [];
+  let prev = null;
+  for (const [lo, la] of line) {
+    if (d3.geoDistance([lo, la], TARGET) > CEIL_CLIP * rad) { prev = null; continue; }
+    const s = project(ecef(lo, la)); if (!s) { prev = null; continue; }
+    const d = Math.hypot(s[0] - cx, s[1] - cy);
+    if (prev && (prev.d - R) * (d - R) < 0) {
+      const k = (R - prev.d) / (d - prev.d);
+      out.push([prev.s[0] + k * (s[0] - prev.s[0]), prev.s[1] + k * (s[1] - prev.s[1])]);
+    }
+    prev = { s, d };
+  }
+  return out;
+}
+const parallel = (lat, step = 0.25) => d3.range(100, 180.001, step).map(lo => [lo, lat]);
+const meridian = (lon, step = 0.25) => d3.range(0, 70.001, step).map(la => [lon, la]);
+
+function drawCircle(t, band) {
+  const { x: cx, y: cy, R } = lay.circle;
+  const path = d3.geoPath(ceil, ctx);
+  ctx.save();
+  ctx.beginPath(); ctx.arc(cx, cy, R, 0, 6.2832); ctx.fillStyle = C.ai; ctx.fill(); ctx.clip();
+  // 天井：陸・5° の経緯線・海岸
+  ctx.beginPath(); path(land); ctx.fillStyle = C.aiLand; ctx.fill();
+  ctx.beginPath(); path(d3.geoGraticule().step([5, 5]).extent([[95, -5], [185, 75]])());
+  ctx.globalAlpha = 0.22; ctx.lineWidth = 0.6; ctx.strokeStyle = C.line; ctx.stroke();
+  ctx.beginPath(); path(coast); ctx.globalAlpha = 0.75; ctx.lineWidth = 1.1; ctx.stroke(); ctx.globalAlpha = 1;
+  // 帯の南北の緯線（朱）
+  ctx.globalAlpha = band.a; ctx.strokeStyle = C.shuAi; ctx.lineWidth = 1.2;
+  for (const la of [band.phi - HALF, band.phi + HALF]) { ctx.beginPath(); path({ type: 'LineString', coordinates: parallel(la, 1) }); ctx.stroke(); }
+  ctx.globalAlpha = 1;
+  // 星：浅い順（遠い順）。帯の外は ×0.35（帯が消える間は全体が 0.35 に寄る）
+  for (const r of Q) {
+    const s = project(r.p); if (!s) continue;
+    const dx = s[0] - cx, dy = s[1] - cy; if (dx * dx + dy * dy > (R + 8) ** 2) continue;
+    const inBand = Math.abs(r[1] - band.phi) <= HALF;
+    const alpha = inBand ? 0.35 + 0.65 * band.a : 0.35;
+    let rr = magR(r[3]) * clamp(ZREF / s[2], 0.75, 2.0);
+    if (r.cls === 0) rr = Math.min(rr, 1.8);
+    drawStar(s[0], s[1], rr, r.cls, alpha);
+    if (r === deepest) deepest.scr = [s[0], s[1], rr];
+  }
+  ctx.globalAlpha = 1;
+  // いちばん深い 683 km：朱の輪とラベル
+  if (deepest.scr) {
+    const [x, y, rr] = deepest.scr;
+    ctx.strokeStyle = C.shuAi; ctx.lineWidth = 0.8; starPath(x, y, rr + 4); ctx.stroke();
+    halo(`${Math.round(stats.deepest.depth)} km（${stats.deepest.year}）`, x + rr + 8, y + 4, `500 11px ${JP}`, C.line, 'left');
+  }
+  // 地名（画面座標に普通に書くので鏡文字にならない）
+  for (const [n, lo, la] of PLACES) {
+    const s = project(ecef(lo, la)); if (!s) continue;
+    ctx.fillStyle = C.line; starPath(s[0], s[1], 2); ctx.fill();
+    halo(n, s[0], s[1] - 7, `500 13px ${JP}`, C.line, 'center');
+  }
+  for (const [n, lo, la] of SEAS) {
+    const s = project(ecef(lo, la)); if (!s) continue;
+    ctx.globalAlpha = 0.6; halo(n, s[0], s[1], `500 15px ${JP}`, C.line, 'center', 6); ctx.globalAlpha = 1;
+  }
+  ctx.restore();
+  drawRing(band);
+}
+function halo(s, x, y, font, color, align, spacing = 0) {
+  ctx.font = font; ctx.textAlign = align; ctx.textBaseline = 'alphabetic'; ctx.letterSpacing = spacing + 'px';
+  ctx.lineWidth = 3; ctx.strokeStyle = C.ai; ctx.lineJoin = 'round'; ctx.strokeText(s, x, y);
+  ctx.fillStyle = color; ctx.fillText(s, x, y); ctx.letterSpacing = '0px';
+}
+
+function drawRing(band) {
+  const { x: cx, y: cy, R } = lay.circle, RO = R + 14;
+  ctx.strokeStyle = C.ink;
+  ctx.lineWidth = 0.6; ctx.beginPath(); ctx.arc(cx, cy, R, 0, 6.2832); ctx.stroke();
+  ctx.lineWidth = 1.2; ctx.beginPath(); ctx.arc(cx, cy, RO, 0, 6.2832); ctx.stroke();
+  // 輪の目盛り：1° 経緯線が円と交わる所に刻み、5° は長くしてラベル
+  const labels = [];
+  const tick = (lines, isLon) => {
+    for (const v of lines) {
+      const five = v % 5 === 0;
+      for (const [x, y] of circleCrossings(isLon ? meridian(v) : parallel(v))) {
+        const a = Math.atan2(y - cy, x - cx), ux = Math.cos(a), uy = Math.sin(a);
+        ctx.lineWidth = five ? 0.8 : 0.5; ctx.beginPath();
+        ctx.moveTo(cx + ux * R, cy + uy * R); ctx.lineTo(cx + ux * (R + (five ? 9 : 4)), cy + uy * (R + (five ? 9 : 4))); ctx.stroke();
+        if (five && (lay.wide || W >= 500 || v % 10 === 0)) labels.push(   // スマホは 10° ごとに間引く
+          { a, s: isLon ? `${v}°E` : `${v}°N` });
+      }
+    }
+  };
+  tick(d3.range(110, 171), true); tick(d3.range(5, 66), false);
+  ctx.font = `11px ${FELL}`; ctx.fillStyle = C.ink; ctx.textBaseline = 'middle';
+  const placed = [];
+  for (const l of labels) {
+    // 方位の字の近く（上下左右 ±7°）と、近すぎるラベルは出さない
+    const card = [0, 0.5, 1, -0.5].some(c => Math.abs(((l.a / Math.PI - c + 3) % 2) - 1) < 0.08);
+    if (card || placed.some(p => Math.abs(Math.atan2(Math.sin(p - l.a), Math.cos(p - l.a))) < 0.07)) continue;
+    placed.push(l.a);
+    const rr = RO + 6, x = cx + Math.cos(l.a) * rr, y = cy + Math.sin(l.a) * rr;
+    ctx.textAlign = Math.abs(Math.cos(l.a)) < 0.3 ? 'center' : Math.cos(l.a) > 0 ? 'left' : 'right';
+    const dy = Math.abs(Math.cos(l.a)) < 0.3 ? Math.sign(Math.sin(l.a)) * 6 : 0;
+    ctx.fillText(l.s, x, y + dy);
+  }
+  ctx.textBaseline = 'alphabetic';
+  // 帯の両端の緯度に朱の三角（輪の中、内向き）
+  ctx.globalAlpha = band.a; ctx.fillStyle = C.shuPaper;
+  for (const la of [band.phi - HALF, band.phi + HALF]) {
+    for (const [x, y] of circleCrossings(parallel(la))) {
+      const a = Math.atan2(y - cy, x - cx), ux = Math.cos(a), uy = Math.sin(a), px = -uy, py = ux;
+      const bx = cx + ux * (R + 12), by = cy + uy * (R + 12), tx = cx + ux * (R + 2), ty = cy + uy * (R + 2);
+      ctx.beginPath(); ctx.moveTo(tx, ty); ctx.lineTo(bx + px * 4, by + py * 4); ctx.lineTo(bx - px * 4, by - py * 4); ctx.fill();
+    }
+  }
+  ctx.globalAlpha = 1;
+  // 方位（北・南・東・西）とラテン語。左右のラテン語は縦に回して輪に沿わせる
+  const jp = `700 17px ${JP}`, la = `11px ${FELLSC}`;
+  text('北', cx, cy - RO - 10, jp, C.ink, 'center');
+  text('SEPTENTRIO', cx, cy - RO - 31, la, C.ink, 'center', 2.75);
+  text('南', cx, cy + RO + 20, jp, C.ink, 'center');
+  text('MERIDIES', cx, cy + RO + 33, la, C.ink, 'center', 2.75);
+  text('東', cx - RO - 10, cy + 6, jp, C.ink, 'right');
+  text('西', cx + RO + 10, cy + 6, jp, C.ink, 'left');
+  for (const [s, x, rot] of [['ORIENS', cx - RO - 38, -Math.PI / 2], ['OCCIDENS', cx + RO + 38, Math.PI / 2]]) {
+    ctx.save(); ctx.translate(x, cy); ctx.rotate(rot); text(s, 0, 4, la, C.ink, 'center', 2.75); ctx.restore();
+  }
+  lay.westBox = { x: cx + RO + 10, y: cy - 12, w: 18, h: 22 };
+  lay.westLatin = { x: cx + RO + 32, y: cy - 40, w: 12, h: 80 };
+}
+
+// 二 数える：深さ 3 段のはしご図
+function drawNi() {
+  const { x, y, w } = lay.ni, mob = !lay.wide && lay.ni.mob;
+  text('二　数える ── 深いほど西へ', x, y, `700 16px ${JP}`, C.ink, 'left', 1.6);
+  const labels = ['0〜70 km', '70〜300 km', '300 km より深い'];
+  const numSize = [20, 20, 40];
+  const numW = 96, labW = mob ? 0 : 196, bx = x + labW, bw = w - labW - numW - 10;
+  let ry = y + 22;
+  text('← 東（太平洋側）', bx, ry + 6, `500 11px ${JP}`, C.sumi, 'left');
+  text('西（日本海側）→', bx + bw, ry + 6, `500 11px ${JP}`, C.sumi, 'right');
+  ry += 14;
+  for (let i = 0; i < 3; i++) {
+    const rowH = i === 2 ? 46 : 34;
+    const cyRow = ry + rowH / 2 + (mob ? 10 : 0);
+    // 深さの記号：藍の円に星
+    const sx = mob ? x + 8 : x + 8;
+    const symY = mob ? ry + 6 : cyRow;
+    ctx.fillStyle = C.ai; starPath(sx, symY, 8); ctx.fill();
+    drawStar(sx, symY, i === 2 ? 3 : 2.4, i, 1); ctx.globalAlpha = 1;
+    text(`${labels[i]}　${stats.band[i].toLocaleString()} 件`, sx + 14, symY + 4.5, `500 13px ${JP}`, C.ink, 'left');
+    // 棒：100% ＝ 段の全件。西の分を右からインクで塗る
+    const by = mob ? ry + 18 : cyRow - 7, bh = 14;
+    ctx.strokeStyle = C.ink; ctx.lineWidth = 0.75; ctx.strokeRect(bx + 0.5, by + 0.5, bw - 1, bh - 1);
+    const ww = bw * stats.westShare[i];
+    ctx.fillStyle = C.ink; ctx.fillRect(bx + bw - ww, by, ww, bh);
+    text(`${Math.round(stats.westShare[i] * 100)}%`, x + w, (mob ? by + bh / 2 : cyRow) + numSize[i] * 0.36, `800 ${numSize[i]}px ${JP}`, C.ink, 'right');
+    ry += rowH + (mob ? 26 : 0);
+  }
+  text('東経 140° より西にある割合', bx, ry + 12, `500 12px ${JP}`, C.sumi, 'left');
+}
+
+// 三 切る：北から見た断面（東が左、西が右）。縦横同じ縮尺
+function secGeom() {
+  const s = lay.san;
+  const dw = lay.wide ? 570 : s.dw, dh = lay.wide ? 190 : s.dh;   // 570px ＝ 2,100 km、190px ＝ 700 km（縦横同じ縮尺）
+  const top = s.y + 46, plate = { x: s.x, y: top, w: s.w, h: dh + 60 };
+  const area = { x: plate.x + 30, y: plate.y + 30, w: dw, h: dh };
+  return { plate, area, kmpx: SEC_DEPTH / dh };
+}
+function drawSan(t, band) {
+  const s = lay.san, g = secGeom(), { plate, area, kmpx } = g;
+  const k = kmPerDeg(band.phi);
+  const X = lon => area.x + area.w / 2 - (lon - SEC_LON0) * k / kmpx;   // 東が左
+  const Y = d => area.y + d / kmpx;
+  lay.secArea = area; lay.secX = X; lay.secY = Y;
+  text('三　切る ── 縦横同じ縮尺', s.x, s.y + 6, `700 16px ${JP}`, C.ink, 'left', 1.6);
+  if (!lay.wide) {   // 狭い画面は引き出し線の代わりに、見出しの横へ朱の帯の印
+    ctx.font = `700 16px ${JP}`; ctx.letterSpacing = '1.6px'; const hw = ctx.measureText('三　切る ── 縦横同じ縮尺').width; ctx.letterSpacing = '0px';
+    ctx.globalAlpha = band.a; ctx.fillStyle = C.shuPaper; ctx.fillRect(s.x + hw + 8, s.y - 4, 18, 6); ctx.globalAlpha = 1;
+  }
+  // 2 行目：停止中だけ数字
+  const st = band.stop && stats.stops[STOPS.indexOf(band.stop)];
+  if (st && band.na > 0) {
+    ctx.globalAlpha = band.na;
+    const msg = `${st.name}　北緯 ${st.lo}〜${st.hi}°　70 km より深い ${st.n} 件` +
+      (st.show ? `　相関 ${fmtSigned(st.r)}` : '　直線には乗らない（|相関| が 0.9 未満）');
+    const lines = wrapLines(msg, `500 13px ${JP}`, s.w);
+    lines.forEach((l, i) => text(l, s.x, s.y + 26 + i * 17, `500 13px ${JP}`, C.ink, 'left'));
+    ctx.globalAlpha = 1;
+  }
+  // 版
+  ctx.fillStyle = C.ai; ctx.fillRect(plate.x, plate.y, plate.w, plate.h);
+  ctx.strokeStyle = C.ink; ctx.lineWidth = 1; ctx.strokeRect(plate.x + 0.5, plate.y + 0.5, plate.w - 1, plate.h - 1);
+  ctx.save(); ctx.beginPath(); ctx.rect(plate.x, plate.y, plate.w, plate.h); ctx.clip();
+  // 深さの横線と目盛り
+  for (let d = 0; d <= 700; d += 100) {
+    ctx.globalAlpha = 0.10; ctx.fillStyle = C.line; ctx.fillRect(area.x, Y(d), area.w, 1); ctx.globalAlpha = 1;
+    text(String(d), area.x - 5, Y(d) + 4, `11px ${FELL}`, C.line, 'right');
+  }
+  // 経度 5° ごとの目盛り（帯の緯度で km 換算が変わる）
+  for (let lo = 120; lo <= 160; lo += 5) {
+    const x = X(lo); if (x < area.x - 1 || x > area.x + area.w + 1) continue;
+    ctx.fillStyle = C.line; ctx.fillRect(x, area.y - 5, 1, 4);
+    text(`${lo}°E`, x, area.y - 9, `11px ${FELL}`, C.line, 'center');
+  }
+  text('東', area.x + 200 / kmpx + 30, area.y + area.h - 4, `500 12px ${JP}`, C.line, 'left');
+  text('西', area.x + area.w - 4, area.y + area.h - 4, `500 12px ${JP}`, C.line, 'right');
+  // 地表：線 1px、帯の中央緯度で陸にかかる区間は 3px
+  ctx.fillStyle = C.line; ctx.fillRect(area.x, Y(0), area.w, 1);
+  for (const [a, b] of landSpans(band.phi)) {
+    const x0 = clamp(Math.min(X(a), X(b)), area.x, area.x + area.w), x1 = clamp(Math.max(X(a), X(b)), area.x, area.x + area.w);
+    if (x1 > x0) ctx.fillRect(x0, Y(0) - 1, x1 - x0, 3);
+  }
+  // 点：帯の中
+  for (const r of Q) {
+    if (Math.abs(r[1] - band.phi) > HALF) continue;
+    const x = X(r[0]); if (x < area.x - 4 || x > area.x + area.w + 4) continue;
+    drawStar(x, Y(r[2]), r.cls === 0 ? Math.min(magR(r[3]), 1.8) : magR(r[3]), r.cls, band.a);
+    if (r === deepest && band.stop && band.stop.name === '伊豆・小笠原') deepest.sec = [x, Y(r[2]), magR(r[3])];
+  }
+  ctx.globalAlpha = 1;
+  // 固定値の列（10 km と 35 km）
+  // 基本は描画域の右端の内側。帯の点が字の箱にかかるときだけ左端へ移す（伊豆・小笠原では南西諸島の点が右端に来る）
+  const busy = (x0, x1) => Q.filter(r => Math.abs(r[1] - band.phi) <= HALF && r[2] <= 120)
+    .filter(r => { const x = X(r[0]), y = Y(r[2]); return x > x0 - 4 && x < x1 + 4 && y > Y(35) + 2 && y < Y(35) + 22; }).length;
+  const right = busy(area.x + area.w - 58, area.x + area.w) <= busy(area.x, area.x + 58);
+  const fx = right ? area.x + area.w : area.x, sg = right ? -1 : 1;
+  ctx.strokeStyle = C.line; ctx.lineWidth = 0.6; ctx.globalAlpha = 0.8;
+  ctx.beginPath(); ctx.moveTo(fx + sg * 70, Y(10)); ctx.lineTo(fx + sg * 54, Y(35) + 12); ctx.moveTo(fx + sg * 70, Y(35)); ctx.lineTo(fx + sg * 54, Y(35) + 12); ctx.stroke();
+  halo('固定値の列', fx + sg * 2, Y(35) + 16, `500 10px ${JP}`, C.line, right ? 'right' : 'left');
+  ctx.globalAlpha = 1;
+  // 当てはめ線と角度（停止中で、|相関| ≥ 0.9 かつ 30 件以上のときだけ）
+  if (st && st.show && band.na > 0) {
+    ctx.globalAlpha = band.na * band.a;
+    const lonAt = d => SEC_LON0 + ((d - st.icpt) / st.slope) / k;
+    const p0 = [X(lonAt(70)), Y(70)], p1 = [X(lonAt(st.maxDepth)), Y(st.maxDepth)];
+    ctx.setLineDash([5, 4]); ctx.strokeStyle = C.shuAi; ctx.lineWidth = 1.4;
+    ctx.beginPath(); ctx.moveTo(...p0); ctx.lineTo(...p1); ctx.stroke(); ctx.setLineDash([]);
+    const ang = Math.atan2(p1[1] - p0[1], p1[0] - p0[0]);
+    ctx.lineWidth = 0.8; ctx.beginPath(); ctx.moveTo(p0[0], p0[1]); ctx.lineTo(p0[0] + 52, p0[1]); ctx.stroke();
+    const sc = Math.min(1, area.h / 200), ar = 36 * Math.max(sc, 0.6);
+    ctx.beginPath(); ctx.arc(p0[0], p0[1], ar, 0, ang); ctx.stroke();
+    halo(`約${Math.round(st.dip)}°`, p0[0] + ar + 22, p0[1] + 30, `800 ${Math.round(26 * Math.max(sc, 0.62))}px ${JP}`, C.line, 'left');
+    lay.fitPx = { p0, p1, ang: ang / rad };
+    ctx.globalAlpha = 1;
+  } else lay.fitPx = null;
+  if (deepest.sec && band.na > 0 && band.stop && band.stop.name === '伊豆・小笠原') {
+    const [x, y, rr] = deepest.sec; ctx.globalAlpha = band.na;
+    ctx.strokeStyle = C.shuAi; ctx.lineWidth = 0.8; starPath(x, y, rr + 4); ctx.stroke();
+    text(`${Math.round(stats.deepest.depth)} km（${stats.deepest.year}）`, x - rr - 8, y + 4, `500 11px ${JP}`, C.line, 'right');
+    ctx.globalAlpha = 1;
+  }
+  deepest.sec = null;
+  // 縮尺：200 km × 200 km の L 字
+  const sl = 200 / kmpx, lx = area.x + 12, ly = area.y + area.h - 10;
+  ctx.strokeStyle = C.line; ctx.lineWidth = 1; ctx.beginPath();
+  ctx.moveTo(lx, ly - sl); ctx.lineTo(lx, ly); ctx.lineTo(lx + sl, ly); ctx.stroke();
+  text('200 km', lx + 4, ly - sl + 10, `11px ${FELL}`, C.line, 'left');
+  text('200 km', lx + sl / 2, ly - 4, `11px ${FELL}`, C.line, 'center');
+  ctx.restore();
+}
+const fmtSigned = v => (v < 0 ? '−' : '+') + Math.abs(v).toFixed(2);
+
+// 緯度 φ の線が陸にかかる経度区間（海岸線との交点を数えて求める）
+const spanCache = new Map();
+function landSpans(phi) {
+  const key = phi.toFixed(2); if (spanCache.has(key)) return spanCache.get(key);
+  const lo0 = SEC_LON0 - SEC_KM / 2 / kmPerDeg(phi) - 1, lo1 = SEC_LON0 + SEC_KM / 2 / kmPerDeg(phi) + 1;
+  const xs = [];
+  for (const seg of coastSegs) {
+    if ((seg[1] - phi) * (seg[3] - phi) >= 0) continue;
+    const x = seg[0] + (phi - seg[1]) / (seg[3] - seg[1]) * (seg[2] - seg[0]);
+    if (x > lo0 && x < lo1) xs.push(x);
+  }
+  xs.sort((a, b) => a - b);
+  let inside = d3.geoContains(land, [lo0, phi]); const out = []; let start = inside ? lo0 : null;
+  for (const x of xs) { if (inside) out.push([start, x]); else start = x; inside = !inside; }
+  if (inside) out.push([start, lo1]);
+  spanCache.set(key, out); return out;
+}
+let coastSegs = [];
+
+// 円と断面を結ぶ引き出し線（円の右側で帯の中央緯度の点 → 版の左辺の中央）。「西」の字の所は 6px 空ける
+function drawLeader(band) {
+  if (!lay.wide) return;
+  const pts = circleCrossings(parallel(band.phi)); if (!pts.length) return;
+  const a = pts.reduce((m, p) => p[0] > m[0] ? p : m);
+  const { plate } = secGeom(), b = [plate.x, plate.y + plate.h / 2];
+  ctx.save();
+  ctx.beginPath(); ctx.rect(0, 0, lay.w, lay.h);
+  for (const bx of [lay.westBox, lay.westLatin]) ctx.rect(bx.x - 6 + bx.w + 12, bx.y - 6, -(bx.w + 12), bx.h + 12);
+  ctx.clip('evenodd');
+  ctx.globalAlpha = band.a; ctx.strokeStyle = C.shuPaper; ctx.lineWidth = 0.8;
+  ctx.beginPath(); ctx.moveTo(...a); ctx.lineTo(...b); ctx.stroke();
+  ctx.restore();
+  lay.leader = { a, b };
+}
+
+function drawText() {
+  const h = lay.head;
+  if (lay.wide) {
+    text('足の下の星座', h.x, h.y + 40, `800 46px ${JP}`, C.ink, 'left', 7.4);
+    text('PLANISPHAERIUM SUBTERRANEUM', h.x, h.y + 66, `14px ${FELLSC}`, C.ink, 'left', 3.5);
+    text('#30DayMapChallenge Day 15: Inside out', h.x, h.y + 88, `14px ${FELL}`, C.sumi, 'left');
+    DESC.replace('件）。', '件）。\n').split('\n').forEach(   // 1600 幅は意味の切れ目で明示改行
+     (l, i) => text(l, h.x, h.y + 120 + i * 26.4, `500 16px ${JP}`, C.ink));
+    const ic = lay.circle;
+    ctx.font = `700 16px ${JP}`; ctx.letterSpacing = '1.6px'; const w1 = ctx.measureText(ICHI_H + '　').width; ctx.letterSpacing = '0px';
+    ctx.font = `500 13px ${JP}`; const w2 = ctx.measureText(ICHI_T).width;
+    const x0 = ic.x - (w1 + w2) / 2;
+    text(ICHI_H + '　', x0, lay.ichi.y, `700 16px ${JP}`, C.ink, 'left', 1.6);
+    text(ICHI_T, x0 + w1, lay.ichi.y, `500 13px ${JP}`, C.ink, 'left');
+  } else {
+    text('足の下の星座', h.x, h.y + h.titleSize, `800 ${h.titleSize}px ${JP}`, C.ink, 'left', h.titleSize * 0.16);
+    text('PLANISPHAERIUM SUBTERRANEUM', h.x, h.y + h.titleSize + 22, `12px ${FELLSC}`, C.ink, 'left', 3);
+    text('#30DayMapChallenge Day 15: Inside out', h.x, h.y + h.titleSize + 42, `13px ${FELL}`, C.sumi, 'left');
+    const fs = h.w < 500 ? 14 : 16;
+    wrapLines(DESC, `500 ${fs}px ${JP}`, h.w).forEach((l, i) => text(l, h.x, h.y + h.titleSize + 70 + i * (fs * 1.65), `500 ${fs}px ${JP}`, C.ink));
+    text(ICHI_H, h.x, lay.ichi.y, `700 16px ${JP}`, C.ink, 'left', 1.6);
+    wrapLines(ICHI_T, `500 13px ${JP}`, h.w).forEach((l, i) => text(l, h.x, lay.ichi.y + 22 + i * 20, `500 13px ${JP}`, C.ink));
+  }
+  // 規模の凡例
+  const g = lay.legend;
+  text('規模（星の大きさ）', g.x, g.y, `500 13px ${JP}`, C.ink);
+  [['M4.5', 4.7], ['5', 5.5], ['6', 6.5], ['7', 7.2]].forEach(([s, m], i) => {
+    const x = g.x + 140 + i * 58;
+    ctx.fillStyle = C.ink; starPath(x, g.y - 4.5, magR(m)); ctx.fill();
+    text(s, x + 8, g.y, `12px ${FELL}`, C.ink);
+  });
+  // 注記と出典
+  wrapLines(NOTE, `500 11.5px ${JP}`, lay.note.w).forEach((l, i) => text(l, lay.note.x, lay.note.y + i * 18, `500 11.5px ${JP}`, C.sumi));
+  const sr = lay.src;
+  if (lay.wide) {
+    text('出典：USGS Earthquake Hazards Program（FDSN event API）／Natural Earth', sr.x, sr.y, `500 11.5px ${JP}`, C.sumi);
+    text('2006〜2025 年、M4.5 以上', sr.x + sr.w, sr.y, `500 11.5px ${JP}`, C.sumi, 'right');
+  } else {
+    wrapLines('出典：USGS Earthquake Hazards Program（FDSN event API）／Natural Earth', `500 11.5px ${JP}`, sr.w)
+      .forEach((l, i) => text(l, sr.x, sr.y + i * 18, `500 11.5px ${JP}`, C.sumi));
+    text('2006〜2025 年、M4.5 以上', sr.x, sr.y + 40, `500 11.5px ${JP}`, C.sumi);
+  }
+}
+
+function draw(t) {
+  setCamera(t);
+  const band = bandAt(t);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = C.paper; ctx.fillRect(0, 0, W, H);
+  ctx.setTransform(dpr * lay.u, 0, 0, dpr * lay.u, dpr * lay.ox, dpr * lay.oy);
+  drawFrame();
+  drawCircle(t, band);
+  drawText();
+  drawNi();
+  drawSan(t, band);
+  drawLeader(band);
+  lay.band = band;
+}
+
+// ---- 動き ---------------------------------------------------------------
+const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+let paused = reduce || SHOT, manual = false, tNow = reduce ? 10 : 0, last = null;
+const btn = document.getElementById('stop');
+function setPaused(v) { paused = v; btn.textContent = v ? '動かす' : '動きを止める'; btn.setAttribute('aria-pressed', String(v)); last = null; }
+btn.addEventListener('click', () => setPaused(!paused));
+function loop(now) {
+  if (manual) return;
+  if (!paused && last !== null) tNow = (tNow + (now - last) / 1000) % L;
+  last = now; draw(tNow); requestAnimationFrame(loop);
+}
+window.__ready = (async () => {
+  const [data, topo] = await Promise.all([fetch('data.json').then(r => r.json()), fetch('land-50m.json').then(r => r.json())]);
+  Q = data.quakes.sort((a, b) => a[2] - b[2]);
+  for (const r of Q) { r.p = ecef(r[0], r[1], r[2]); r.cls = depthClass(r[2]); }
+  land = topojson.feature(topo, topo.objects.land);
+  coast = topojson.mesh(topo, topo.objects.land);
+  for (const line of coast.coordinates) for (let i = 1; i < line.length; i++) {
+    const [a, b] = [line[i - 1], line[i]];
+    if (Math.max(a[0], b[0]) > 100 && Math.min(a[0], b[0]) < 180 && Math.max(a[1], b[1]) > 15 && Math.min(a[1], b[1]) < 55) coastSegs.push([a[0], a[1], b[0], b[1]]);
+  }
+  stats = computeStats(Q); window.__stats = stats;
+  deepest = Q.find(r => r[5] === stats.deepest.id);
+  const jp = DESC + NOTE + ICHI_H + ICHI_T + '足の下の星座二三数える切る深いほど西へ縦横同じ縮尺東北海道千島伊豆小笠原北緯相関件直線には乗らない南東西京札幌福岡ソウル太平洋日本海規模星の大きさ出典年以上固定値の列約動きを止める割合経より側→←〜−｜|';
+  await Promise.all([
+    document.fonts.load(`800 46px "Shippori Mincho B1"`, jp), document.fonts.load(`700 16px "Shippori Mincho B1"`, jp),
+    document.fonts.load(`500 13px "Shippori Mincho B1"`, jp), document.fonts.load(`11px "IM Fell English"`, 'Aa0°'),
+    document.fonts.load(`11px "IM Fell English SC"`, 'Aa'),
+  ]);
+  await document.fonts.ready;
+  resize(); setPaused(paused); requestAnimationFrame(loop);
+  addEventListener('resize', () => { resize(); if (manual) draw(tNow); });
+  return true;
+})();
+// 時刻 t の絵を描き、フォントと描画が済んだら resolve する。呼んだら rAF のループは止める
+window.__frame = async t => {
+  await window.__ready; await document.fonts.ready;
+  manual = true; tNow = t; draw(t);
+  await new Promise(r => requestAnimationFrame(() => r()));
+};
+// 検証用（画面には出ない）
+window.__dbg = { bandAt, get lay() { return lay; }, proj(lon, lat, depth, t) { setCamera(t); return project(ecef(lon, lat, depth)); } };
+</script>
+</body>
+</html>

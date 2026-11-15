@@ -66,7 +66,7 @@ try {
     const fps = +(a5 ?? 30), loop = +(a6 ?? (await ev('LOOP')));
     const n = Math.round(fps * loop);
     mkdirSync(arg, { recursive: true });
-    for (let k = 0; k < n; k++) {
+    for (let k = +(process.env.START ?? 0); k < n; k++) {  // START=k で途中から撮り直せる
       await ev(`__frame(${k / fps})`);  // k = n は k = 0 と同じ絵になるので撮らない
       await shoot(join(arg, `frame_${String(k).padStart(4, '0')}.png`));
       if (k % 30 === 0) console.log(`frame ${k}/${n}`);
